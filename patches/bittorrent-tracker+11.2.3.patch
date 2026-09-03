@@ -1,0 +1,30 @@
+diff --git a/node_modules/bittorrent-tracker/lib/client/http-tracker.js b/node_modules/bittorrent-tracker/lib/client/http-tracker.js
+index 43464e8..a7c3403 100644
+--- a/node_modules/bittorrent-tracker/lib/client/http-tracker.js
++++ b/node_modules/bittorrent-tracker/lib/client/http-tracker.js
+@@ -14,7 +14,11 @@ const HTTP_SCRAPE_SUPPORT = /\/(announce)[^/]*$/
+ function abortTimeout (ms) {
+   const controller = new AbortController()
+   setTimeout(() => {
+-    controller.abort()
++    try {
++      controller.abort()
++    } catch {
++      // ignore: Node >=22 may re-throw AbortError from a pending fetch
++    }
+   }, ms).unref?.()
+   return controller
+ }
+@@ -133,7 +137,11 @@ class HTTPTracker extends Tracker {
+     const cleanup = () => {
+       if (!controller.signal.aborted) {
+         arrayRemove(this.cleanupFns, this.cleanupFns.indexOf(cleanup))
+-        controller.abort()
++        try {
++          controller.abort()
++        } catch {
++          // ignore: Node >=22 may re-throw AbortError from a pending fetch
++        }
+         controller = null
+       }
+       if (this.maybeDestroyCleanup) this.maybeDestroyCleanup()
