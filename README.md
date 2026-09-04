@@ -10,7 +10,6 @@ general
 todo
 - qsv not tested
 - subtitles slow down transcoding immensely
-- no watchdog
 - shit ui on a phone screen
 
 
