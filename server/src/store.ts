@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import type { Topic } from './types.js';
 
@@ -115,12 +116,21 @@ function sleepMs(ms: number): void {
   // приостанавливает поток без busy-loop (100% CPU на Windows-локах).
   try {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    return;
   } catch {
-    /* Atomics.wait может быть недоступен в некоторых окружениях — падаем на старый цикл */
-    const until = Date.now() + ms;
-    while (Date.now() < until) {
-      /* noop */
+    /* Atomics.wait может быть недоступен в некоторых окружениях — фолбэк ниже */
+  }
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('powershell', ['-NoProfile', '-Command', `Start-Sleep -Milliseconds ${ms}`], {
+        stdio: 'ignore',
+        timeout: ms + 2000,
+      });
+    } else {
+      spawnSync('sleep', [(ms / 1000).toString()], { stdio: 'ignore', timeout: ms + 2000 });
     }
+  } catch {
+    /* ignore */
   }
 }
 
@@ -163,7 +173,36 @@ function writeJson(file: string, data: unknown) {
   ensureDir(path.dirname(file));
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8');
-  fs.renameSync(tmp, file);
+  // Windows: renameSync поверх существующего файла может упасть EPERM/EEXIST, если
+  // цель на миг залочена (антивирус/конкурентный читатель). Пробуем rename, при сбое
+  // удаляем цель и повторяем; последний фолбэк — прямая запись (теряем атомарность,
+  // но не падаем на EPERM).
+  for (let i = 0; i < 3; i++) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch {
+      if (!fs.existsSync(tmp)) return;
+      if (i < 2) {
+        sleepMs(50);
+        try {
+          fs.rmSync(file, { force: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+  try {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf-8');
+  } catch {
+    /* ignore */
+  }
+  try {
+    fs.rmSync(tmp, { force: true });
+  } catch {
+    /* ignore */
+  }
 }
 
 export class Store {

@@ -21,14 +21,16 @@ const SEGMENT_SECONDS = 2;
 // нужен потолок — иначе remux до EOF быстро забьёт диск).
 const HLS_MAX_BYTES = 20 * 1024 * 1024 * 1024;
 
-function dirSize(dir: string): number {
+// Асинхронный подсчёт размера каталога: синхронный обход всего HLS-кеша на каждый
+// start() блокировал event loop (фризы при перемотке на больших кешах).
+async function dirSizeAsync(dir: string): Promise<number> {
   let total = 0;
   const stack = [dir];
   while (stack.length) {
     const cur = stack.pop()!;
     let entries: fs.Dirent[];
     try {
-      entries = fs.readdirSync(cur, { withFileTypes: true });
+      entries = await fs.promises.readdir(cur, { withFileTypes: true });
     } catch {
       continue;
     }
@@ -38,7 +40,7 @@ function dirSize(dir: string): number {
         stack.push(p);
       } else {
         try {
-          total += fs.statSync(p).size;
+          total += (await fs.promises.stat(p)).size;
         } catch {
           /* ignore */
         }
@@ -172,21 +174,22 @@ export class HlsManager {
 
   // Освобождает место в кеше HLS: удаляет самые старые неактивные сессии, пока
   // суммарный размер не опустится под лимит. Активные (текущие) сессии не трогаем.
-  private gcCache(keepDir: string): void {
+  private async gcCache(keepDir: string): Promise<void> {
     const entries = [...this.sessions.entries()].map(([key, s]) => ({
       key,
       dir: s.dir,
       startedAt: s.startedAt,
       active: this.activeByFile.get(this.fileKey(s.topicId, s.fileIndex)) === key,
     }));
-    let total = entries.reduce((sum, e) => sum + dirSize(e.dir), 0);
+    let total = 0;
+    for (const e of entries) total += await dirSizeAsync(e.dir);
     if (total <= HLS_MAX_BYTES) return;
 
     entries.sort((a, b) => a.startedAt - b.startedAt);
     for (const e of entries) {
       if (total <= HLS_MAX_BYTES) break;
       if (e.dir === keepDir || e.active) continue;
-      const size = dirSize(e.dir);
+      const size = await dirSizeAsync(e.dir);
       try {
         fs.rmSync(e.dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
       } catch {
@@ -394,7 +397,9 @@ export class HlsManager {
       this.unmapIfActive(session);
       this.progress.delete(session.sessionId);
     }
-    this.gcCache(dir);
+    void this.gcCache(dir).catch((e) =>
+      log.warn(`[cache] hls gc failed: ${e instanceof Error ? e.message : e}`),
+    );
     startTimer();
     return session;
   }

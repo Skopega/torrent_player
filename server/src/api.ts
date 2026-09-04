@@ -226,22 +226,6 @@ export function createApi(services: Services): Router {
     res.json({ ok: true });
   });
 
-  api.post('/topic/:id/stream/start', async (req, res) => {
-    const id = Number(req.params.id);
-    const fileIndex = Number((req.body as { fileIndex?: unknown } | undefined)?.fileIndex);
-    if (!Number.isFinite(id) || !Number.isFinite(fileIndex)) {
-      res.status(400).json({ error: 'bad params' });
-      return;
-    }
-    try {
-      await services.resumeStream(id, fileIndex);
-      res.json({ ok: true });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'resume error';
-      res.status(502).json({ error: msg });
-    }
-  });
-
   api.get('/topic/:id/stream/status', async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) {

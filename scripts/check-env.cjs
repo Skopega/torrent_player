@@ -49,9 +49,17 @@ function resolveXray() {
   return fs.existsSync(p) ? p : null;
 }
 
+function runtimeFfmpeg(name) {
+  const exe = process.platform === 'win32' ? '.exe' : '';
+  const p = path.join(root, 'runtime', 'ffmpeg', name + exe);
+  return fs.existsSync(p) ? p : null;
+}
+
 function ffmpegDefault() {
   try {
     if (process.env.FFMPEG_PATH && fs.existsSync(process.env.FFMPEG_PATH)) return process.env.FFMPEG_PATH;
+    const rt = runtimeFfmpeg('ffmpeg');
+    if (rt) return rt;
     const p = require('ffmpeg-static');
     return p && fs.existsSync(p) ? p : null;
   } catch {
@@ -62,6 +70,8 @@ function ffmpegDefault() {
 function ffprobeDefault() {
   try {
     if (process.env.FFPROBE_PATH && fs.existsSync(process.env.FFPROBE_PATH)) return process.env.FFPROBE_PATH;
+    const rt = runtimeFfmpeg('ffprobe');
+    if (rt) return rt;
     const p = require('ffprobe-static');
     return p && p.path && fs.existsSync(p.path) ? p.path : null;
   } catch {

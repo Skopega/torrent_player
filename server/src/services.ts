@@ -349,13 +349,6 @@ export class Services {
     }
   }
 
-  async resumeStream(topicId: number, fileIndex: number): Promise<void> {
-    this.stream.resume(topicId, fileIndex);
-    if (this.hls.getSession(topicId, fileIndex)) {
-      await this.hls.start(topicId, fileIndex);
-    }
-  }
-
   async enrich(
     ids: number[],
   ): Promise<Record<string, { poster?: string; bitrate?: string; resolution?: string; duration?: string }>> {

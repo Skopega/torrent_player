@@ -259,14 +259,21 @@ export class StreamManager {
   }
 
   private async resolveTorrentId(topicId: number): Promise<Buffer | string> {
-    try {
-      return await this.source.getTorrentBuffer(topicId);
-    } catch (e) {
-      log.warn(`[stream] torrent download failed for ${topicId}, trying magnet`);
-      const magnet = await this.source.getMagnet(topicId);
-      if (magnet) return magnet;
-      throw e instanceof Error ? e : new Error(String(e));
+    // .torrent предпочтителен (известен infoHash → быстрый старт + skipVerify), но не
+    // ждём его провала, чтобы потом последовательно дёргать magnet: запускаем оба сразу.
+    const [torrentRes, magnetRes] = await Promise.allSettled([
+      this.source.getTorrentBuffer(topicId),
+      this.source.getMagnet(topicId),
+    ]);
+    if (torrentRes.status === 'fulfilled') return torrentRes.value;
+    if (magnetRes.status === 'fulfilled' && magnetRes.value) return magnetRes.value;
+    if (torrentRes.status === 'rejected') {
+      log.warn(`[stream] torrent download failed for ${topicId}, magnet unavailable`);
+      const r = torrentRes.reason;
+      throw r instanceof Error ? r : new Error(String(r));
     }
+    log.warn(`[stream] torrent download failed for ${topicId}, no magnet`);
+    throw new Error('Не удалось получить .torrent и magnet.');
   }
 
   private addOptions(skipVerify = false) {

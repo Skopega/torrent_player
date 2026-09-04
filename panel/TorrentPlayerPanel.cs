@@ -80,6 +80,7 @@ namespace TorrentPlayerPanel
         private DateTime _procStartTime;
         private bool _expectedStop;
         private bool _stopping;
+        private bool _starting;
         private bool _allowExit;
         private bool _building;
 
@@ -147,7 +148,7 @@ namespace TorrentPlayerPanel
 
             UpdateButtons();
             if (_config.AutoStartOnLaunch && File.Exists(_nodeExe) && File.Exists(_serverEntry))
-                Shown += (s, e) => StartServer();
+                Shown += async (s, e) => await StartServer(true);
         }
 
         // ---------- UI ----------
@@ -183,11 +184,11 @@ namespace TorrentPlayerPanel
             Controls.Add(bar);
 
             _btnStart = new Button { Text = "Start", Width = 86 };
-            _btnStart.Click += (s, e) => StartServer();
+            _btnStart.Click += async (s, e) => await StartServer(true);
             _btnStop = new Button { Text = "Stop", Width = 86 };
-            _btnStop.Click += (s, e) => StopServer();
+            _btnStop.Click += async (s, e) => await StopServer();
             _btnRestart = new Button { Text = "Restart", Width = 86 };
-            _btnRestart.Click += (s, e) => { StopServer(); StartServer(); };
+            _btnRestart.Click += async (s, e) => { await StopServer(); await StartServer(true); };
             _btnOpen = new Button { Text = "Open browser", Width = 110 };
             _btnOpen.Click += (s, e) =>
             {
@@ -252,12 +253,15 @@ namespace TorrentPlayerPanel
             var menu = new ContextMenuStrip();
             menu.Items.Add("Открыть панель", null, (s, e) => ShowPanel());
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("Start", null, (s, e) => StartServer());
-            menu.Items.Add("Stop", null, (s, e) => StopServer());
+            menu.Items.Add("Start", null, async (s, e) => await StartServer(true));
+            menu.Items.Add("Stop", null, async (s, e) => await StopServer());
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("Выход", null, (s, e) =>
+            menu.Items.Add("Выход", null, async (s, e) =>
             {
                 _allowExit = true;
+                _tray.Visible = false;
+                await StopServer();
+                SaveConfig();
                 Close();
             });
             _tray.ContextMenuStrip = menu;
@@ -294,9 +298,6 @@ namespace TorrentPlayerPanel
                 Hide();
                 return;
             }
-            _tray.Visible = false;
-            StopServer();
-            SaveConfig();
             base.OnFormClosing(e);
         }
 
@@ -462,61 +463,64 @@ namespace TorrentPlayerPanel
 
         // ---------- Supervision ----------
 
-        private void StartServer()
+        private async Task StartServer(bool manual)
         {
-            StartServer(true);
-        }
-
-        private void StartServer(bool manual)
-        {
-            if (_stopping) return;
-            if (_proc != null && !_proc.HasExited)
+            if (_stopping || _starting) return;
+            _starting = true;
+            try
             {
-                LogLine("WARN", "Сервер уже запущен или ещё завершается.");
-                return;
-            }
-            if (_proc != null) _proc = null;
-            CancelRestartTimer();
-            if (manual)
-            {
-                _recentCrashes.Clear();
-                _backoffIndex = 0;
-            }
-            if (!File.Exists(_nodeExe))
-            {
-                LogLine("ERROR", "Node.js не найден: " + _nodeExe);
-                SetState(StateCrashed);
-                return;
-            }
-            if (!File.Exists(_serverEntry))
-            {
-                LogLine("ERROR", "Сервер не собран: " + _serverEntry + ". Нажмите Rebuild.");
-                SetState(StateCrashed);
-                return;
-            }
-
-            if (HealthQuick())
-            {
-                LogLine("INFO", "Порт 3000 отвечает на /api/health — гашу старый сервер...");
-                try
+                if (_proc != null && !_proc.HasExited)
                 {
-                    using (var cts = new CancellationTokenSource(4000))
-                    {
-                        _http.PostAsync(_shutdownUrl, null, cts.Token).Wait();
-                    }
+                    LogLine("WARN", "Сервер уже запущен или ещё завершается.");
+                    return;
                 }
-                catch { }
-                if (!WaitPortFree(10000))
+                if (_proc != null) _proc = null;
+                CancelRestartTimer();
+                if (manual)
                 {
-                    LogLine("ERROR", "Порт 3000 не освободился за 10с — старт отменён.");
+                    _recentCrashes.Clear();
+                    _backoffIndex = 0;
+                }
+                if (!File.Exists(_nodeExe))
+                {
+                    LogLine("ERROR", "Node.js не найден: " + _nodeExe);
                     SetState(StateCrashed);
                     return;
                 }
-                LogLine("INFO", "Порт 3000 свободен.");
-            }
+                if (!File.Exists(_serverEntry))
+                {
+                    LogLine("ERROR", "Сервер не собран: " + _serverEntry + ". Нажмите Rebuild.");
+                    SetState(StateCrashed);
+                    return;
+                }
 
-            _expectedStop = false;
-            StartCore();
+                if (await HealthQuickAsync())
+                {
+                    LogLine("INFO", "Порт 3000 отвечает на /api/health — гашу старый сервер...");
+                    try
+                    {
+                        using (var cts = new CancellationTokenSource(4000))
+                        {
+                            await _http.PostAsync(_shutdownUrl, null, cts.Token);
+                        }
+                    }
+                    catch { }
+                    if (!await WaitPortFreeAsync(10000))
+                    {
+                        LogLine("ERROR", "Порт 3000 не освободился за 10с — старт отменён.");
+                        SetState(StateCrashed);
+                        return;
+                    }
+                    LogLine("INFO", "Порт 3000 свободен.");
+                }
+
+                _expectedStop = false;
+                StartCore();
+            }
+            finally
+            {
+                _starting = false;
+            }
         }
 
         private void StartCore()
@@ -669,7 +673,7 @@ namespace TorrentPlayerPanel
             }
         }
 
-        private void StopServer()
+        private async Task StopServer()
         {
             _expectedStop = true;
             _stopping = true;
@@ -690,16 +694,16 @@ namespace TorrentPlayerPanel
             {
                 using (var cts = new CancellationTokenSource(10000))
                 {
-                    _http.PostAsync(_shutdownUrl, null, cts.Token).Wait();
+                    await _http.PostAsync(_shutdownUrl, null, cts.Token);
                 }
             }
             catch { }
 
-            if (!p.WaitForExit(10000))
+            if (!await Task.Run(() => p.WaitForExit(10000)))
             {
                 LogLine("WARN", "Мягкий стоп не сработал — принудительное завершение.");
                 KillForce(p);
-                p.WaitForExit(5000);
+                await Task.Run(() => p.WaitForExit(5000));
             }
             if (!p.HasExited)
             {
@@ -740,23 +744,22 @@ namespace TorrentPlayerPanel
 
         // ---------- Heartbeat ----------
 
-        private void OnHeartbeatTick(object s, EventArgs e)
+        private async void OnHeartbeatTick(object s, EventArgs e)
         {
             var p = _proc;
             if (p == null || _stopping) return;
             if (p.HasExited) return;
-            CheckHealthAsync();
+            await CheckHealthAsync();
         }
 
-        private void CheckHealthAsync()
+        private async Task CheckHealthAsync()
         {
             try
             {
                 using (var cts = new CancellationTokenSource(3000))
                 {
-                    var task = _http.GetAsync(_healthUrl, cts.Token);
-                    task.Wait(cts.Token);
-                    if (task.Result.IsSuccessStatusCode)
+                    var res = await _http.GetAsync(_healthUrl, cts.Token);
+                    if (res.IsSuccessStatusCode)
                     {
                         _lastHealthOk = true;
                         if (_heartbeatFails != 0) _heartbeatFails = 0;
@@ -798,7 +801,7 @@ namespace TorrentPlayerPanel
 
         // ---------- Build ----------
 
-        private void Rebuild()
+        private async void Rebuild()
         {
             if (_building) return;
             bool wasRunning = _proc != null && !_proc.HasExited;
@@ -808,7 +811,7 @@ namespace TorrentPlayerPanel
             _expectedStop = true;
             if (wasRunning)
             {
-                StopServer();
+                await StopServer();
             }
             _building = true;
             SetState(StateBuilding);
@@ -863,12 +866,12 @@ namespace TorrentPlayerPanel
                     {
                         // Сброс флагов/состояния — на UI-потоке, чтобы не гонять _building
                         // между потоками и не перезаписать более новую сборку.
-                        BeginInvoke((Action)(() =>
+                        BeginInvoke((Action)(async () =>
                         {
                             _building = false;
                             _expectedStop = false;
                             SetState(StateStopped);
-                            if (restartAfter) StartServer();
+                            if (restartAfter) await StartServer(true);
                         }));
                     }
                     catch (ObjectDisposedException) { }
@@ -964,26 +967,25 @@ namespace TorrentPlayerPanel
 
         // ---------- Health quick ----------
 
-        private bool WaitPortFree(int timeoutMs)
+        private async Task<bool> WaitPortFreeAsync(int timeoutMs)
         {
             var sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < timeoutMs)
             {
-                if (!HealthQuick()) return true;
-                Thread.Sleep(500);
+                if (!await HealthQuickAsync()) return true;
+                await Task.Delay(500);
             }
-            return !HealthQuick();
+            return !await HealthQuickAsync();
         }
 
-        private bool HealthQuick()
+        private async Task<bool> HealthQuickAsync()
         {
             try
             {
                 using (var cts = new CancellationTokenSource(2000))
                 {
-                    var task = _http.GetAsync(_healthUrl, cts.Token);
-                    task.Wait(cts.Token);
-                    return task.Result.IsSuccessStatusCode;
+                    var res = await _http.GetAsync(_healthUrl, cts.Token);
+                    return res.IsSuccessStatusCode;
                 }
             }
             catch

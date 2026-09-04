@@ -4,6 +4,7 @@
 
 import { fetch as ufetch } from 'undici';
 import { buildVlessUri } from './vless.js';
+import { assertSafeHttpUrl } from '../url-safe.js';
 
 export interface Strategy {
   name: string;
@@ -408,6 +409,38 @@ export interface FetchVlessOptions {
   timeoutMs?: number;
 }
 
+// Безопасный GET подписки: каждая точка (включая редиректы) обязана быть публичным
+// http(s) адресом — иначе сервер можно заставить читать внутренние ресурсы (SSRF).
+async function safeFetchSubscription(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs: number,
+): Promise<string> {
+  let current = url;
+  for (let i = 0; i < 8; i++) {
+    const safe = await assertSafeHttpUrl(current);
+    current = safe.toString();
+    const res = await ufetch(current, {
+      method: 'GET',
+      headers,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const status = res.status;
+    const location = res.headers.get('location');
+    if (
+      (status === 301 || status === 302 || status === 303 || status === 307 || status === 308) &&
+      location
+    ) {
+      current = new URL(location, current).toString();
+      continue;
+    }
+    const buf = await res.arrayBuffer();
+    return new TextDecoder('utf-8', { fatal: false }).decode(buf);
+  }
+  throw new Error('Слишком много редиректов в подписке');
+}
+
 // Качает подписку (стратегии с Hwid-заголовками), возвращает реальные vless-ссылки.
 export async function fetchVlessNodes(
   subscriptionUrl: string,
@@ -420,19 +453,16 @@ export async function fetchVlessNodes(
   const attempts = await Promise.all(
     strategies.map(async (s): Promise<{ nodes: string[]; body: string }> => {
       try {
-        const res = await ufetch(subscriptionUrl, {
-          method: 'GET',
-          headers: {
+        const body = await safeFetchSubscription(
+          subscriptionUrl,
+          {
             'User-Agent': s.userAgent,
             Accept: '*/*',
             'Accept-Language': 'en-US,en;q=0.9',
             ...(s.headers ?? {}),
           },
-          redirect: 'follow',
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-        const buf = await res.arrayBuffer();
-        const body = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+          timeoutMs,
+        );
         if (!body) return { nodes: [], body };
         const direct = extractVlessNodes(body).filter((n) => !isPlaceholderNode(n));
         const xray = extractVlessFromXrayJson(body).filter((n) => !isPlaceholderNode(n));

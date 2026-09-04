@@ -32,6 +32,19 @@ app.use((_req, res, next) => {
 const services = new Services();
 app.use('/api', createApi(services));
 
+// Мягкое завершение с гардом от конкурентных вызовов: /api/shutdown и сигналы
+// SIGINT/SIGTERM могут прийти одновременно — close() выполняется один раз.
+let closing = false;
+async function shutdown(): Promise<void> {
+  if (closing) return;
+  closing = true;
+  try {
+    await services.close();
+  } finally {
+    process.exit(0);
+  }
+}
+
 // Контрольные эндпоинты для панели-супервизора: проверка живости и мягкий стоп.
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
@@ -39,7 +52,7 @@ app.get('/api/health', (_req, res) => {
 
 app.post('/api/shutdown', (_req, res) => {
   res.json({ ok: true });
-  void services.close().finally(() => process.exit(0));
+  void shutdown();
 });
 
 const webDist = process.env.TP_WEB_DIST
@@ -92,6 +105,6 @@ void main();
 
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => {
-    void services.close().finally(() => process.exit(0));
+    void shutdown();
   });
 }

@@ -1,11 +1,8 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { HttpClient, BASE_URL, resolveUrl } from './http.js';
+import { HttpClient, BASE_URL, resolveUrl, USER_AGENT } from './http.js';
 import { Store } from './store.js';
 import { UnsafeUrlError } from './url-safe.js';
-
-const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // В кеш и клиенту уходят только растровые картинки. SVG и любой HTML (бот-страница
 // Cloudflare/логина) не принимаются — иначе это same-origin XSS при nosniff=off.
@@ -104,7 +101,7 @@ export class Images {
     }
 
     const headers: Record<string, string> = {
-      'User-Agent': UA,
+      'User-Agent': USER_AGENT,
       Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
       // fastpic.org различает ответы по Sec-Fetch-* (см. заголовок Vary):
       // без них запрос выглядит как API/бот и периодически отдаётся 404.

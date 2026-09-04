@@ -117,16 +117,6 @@ export const api = {
     );
   },
 
-  async streamStart(topicId: number, fileIndex: number): Promise<void> {
-    await json<{ ok: boolean }>(
-      await fetch(`/api/topic/${topicId}/stream/start`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileIndex }),
-      }),
-    );
-  },
-
   clientLog(data: unknown): void {
     void fetch('/api/client-log', {
       method: 'POST',
