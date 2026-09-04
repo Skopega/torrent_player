@@ -8,7 +8,10 @@ function collapse(s: string): string {
 }
 
 function parseNum(s: string): number {
-  const n = parseInt(s.replace(/[\s\u00a0]/g, ''), 10);
+  // Разделитель тысяч на rutracker — пробел/NBSP или запятая («31,883 раза»).
+  // parseInt иначе останавливается на запятой и режет число в 1000 раз.
+  const clean = s.replace(/[\s\u00a0\u202f]/g, '').replace(/,/g, '');
+  const n = parseInt(clean, 10);
   return Number.isFinite(n) ? n : 0;
 }
 
@@ -30,18 +33,25 @@ export function parseResolution(title: string): string | null {
 }
 
 // Разрешение из размеров кадра вида "1920x1080" / "1152*482" (анаморфный 720p)
-// / "852x480" / "704x384". Разделители: x, х (кириллица), ×, *.
+// / "852x480" / "720*576" (DVD). Разделители: x, X, х (кириллица), ×, *.
 export function resolutionFromDimensions(text: string): string | null {
-  const m = text.match(/(\d{3,4})\s*[xх×*]\s*(\d{3,4})/);
+  const m = text.match(/(\d{3,4})\s*[xх×X*]\s*(\d{3,4})/);
   if (!m) return null;
   const w = parseInt(m[1], 10);
+  const h = parseInt(m[2], 10);
+  // HD-диапазоны — по ширине (в т.ч. анаморфные 1152/1280 для 720p).
   if (w >= 3200) return '4K';
   if (w >= 2500) return '1440p';
   if (w >= 1900) return '1080p';
-  if (w >= 1080) return '720p'; // 1280 и анаморфные 1152 с PAR
-  if (w >= 1000) return '576p';
-  if (w >= 840) return '480p';
-  return '360p';
+  if (w >= 1152) return '720p';
+  if (w >= 1024) return '576p';
+  // Узкие SD-кадры (DVD 704/720 и т.п.) по ширине не различить — ориентируемся по
+  // высоте, иначе 720×576 классифицировалось бы как «360p».
+  if (h >= 700) return '720p';
+  if (h >= 560) return '576p';
+  if (h >= 470) return '480p';
+  if (h >= 330) return '360p';
+  return null;
 }
 
 // Битрейт из строки вида "2291 Kbps" / "≈10 500 кбит/с" / "6 000 kb/s".
@@ -224,6 +234,11 @@ export function parseTopic(html: string, id: number): Topic {
   const $ = cheerio.load(html);
 
   const title = collapse($('h1.maintitle a#topic-title').text());
+  // Защитный/битый ответ (Cloudflare, страница логина, обрыв) не должен молча
+  // кешироваться как «пустой топик» — это вечный мусор в topicCache/на диске.
+  if (!title || $('div.post_body').length === 0) {
+    throw new Error('Топик не распознан (пустой или защитный ответ rutracker).');
+  }
   const category = collapse($('td.t-breadcrumb-top a').last().text());
 
   const postBody = $('div.post_body').first();

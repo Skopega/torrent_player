@@ -1,8 +1,10 @@
 import iconv from 'iconv-lite';
 import { fetch as ufetch } from 'undici';
 import type { Dispatcher } from 'undici';
+import { Readable } from 'node:stream';
 import { log } from './logger.js';
 import { resolveUserAgent } from './ua.js';
+import { assertSafeHttpUrl } from './url-safe.js';
 import type { VpnProxy } from './vpn/types.js';
 
 export const BASE_URL = 'https://rutracker.org/forum/';
@@ -12,6 +14,14 @@ export const USER_AGENT = resolveUserAgent();
 export interface HttpResponse {
   status: number;
   text: string;
+  finalUrl: string;
+}
+
+export interface HttpRawResponse {
+  status: number;
+  ok: boolean;
+  buffer: Buffer;
+  contentType: string | null;
   finalUrl: string;
 }
 
@@ -50,46 +60,72 @@ export class HttpClient {
     }
   }
 
+  private async dispatcherFor(direct: boolean | undefined): Promise<Dispatcher | undefined> {
+    // Весь трафик к сайтам идёт через активную vless-прокси (если включена);
+    // direct=true — для загрузки подписки и health-проверок самой прокси.
+    if (!direct && this.vpn?.isEnabled()) {
+      const ok = await this.vpn.ensureReady();
+      if (!ok) {
+        throw new Error('Прокси включён, но не поднят. Проверьте статус VPN в шапке.');
+      }
+      return this.vpn.getDispatcher() as Dispatcher | undefined;
+    }
+    return undefined;
+  }
+
   async request(url: string, init?: RequestInit, opts?: { direct?: boolean }): Promise<HttpResponse> {
+    const raw = await this.rawRequest(url, init, { ...opts, timeoutMs: 5000, cookies: true });
+    return { status: raw.status, text: this.decode(raw.buffer), finalUrl: raw.finalUrl };
+  }
+
+  // Бинарный GET с проверкой безопасности каждого хопа (SSRF-защита) и лимитом тела.
+  // Куки НЕ подставляются автоматически (кроме opts.cookies) — caller решает, куда их слать.
+  async rawRequest(
+    url: string,
+    init?: RequestInit,
+    opts?: {
+      direct?: boolean;
+      timeoutMs?: number;
+      maxBytes?: number;
+      cookies?: boolean;
+    },
+  ): Promise<HttpRawResponse> {
     let method = (init?.method ?? 'GET').toUpperCase();
     let body = init?.body as import('undici').BodyInit | undefined;
-    let contentType = (init?.headers as Record<string, string> | undefined)?.['content-type'];
+    const callerHeaders = (init?.headers ?? {}) as Record<string, string>;
+    const timeoutMs = opts?.timeoutMs ?? 10000;
+    const maxBytes = opts?.maxBytes ?? 64 * 1024 * 1024;
+    const withCookies = opts?.cookies ?? false;
 
     const started = Date.now();
     let current = url;
     for (let i = 0; i < 8; i++) {
+      // Каждый хоп (включая редиректы) обязан быть публичным http(s) адресом.
+      const safe = await assertSafeHttpUrl(current);
+      current = safe.toString();
+
       const headers: Record<string, string> = {
         'User-Agent': USER_AGENT,
-        'Accept':
-          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
         'Accept-Encoding': 'gzip, deflate, br',
+        ...callerHeaders,
       };
-      const cookie = this.cookieHeader();
-      if (cookie) headers['Cookie'] = cookie;
-      if (contentType) headers['Content-Type'] = contentType;
-
-      // Весь трафик к сайтам идёт через активную vless-прокси (если включена);
-      // direct=true — для загрузки подписки и health-проверок самой прокси.
-      let dispatcher: Dispatcher | undefined;
-      if (!opts?.direct && this.vpn?.isEnabled()) {
-        const ok = await this.vpn.ensureReady();
-        if (!ok) {
-          throw new Error('Прокси включён, но не поднят. Проверьте статус VPN в шапке.');
-        }
-        dispatcher = this.vpn.getDispatcher() as Dispatcher | undefined;
+      if (withCookies) {
+        const cookie = this.cookieHeader();
+        if (cookie) headers['Cookie'] = cookie;
       }
+
+      const dispatcher = await this.dispatcherFor(opts?.direct);
 
       const res = await ufetch(current, {
         method,
         body,
         headers,
         redirect: 'manual',
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(timeoutMs),
         ...(dispatcher ? { dispatcher } : {}),
       });
-      const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
-      this.mergeSetCookie(setCookies);
 
       const status = res.status;
       const location = res.headers.get('location');
@@ -102,24 +138,41 @@ export class HttpClient {
         if (status === 303 || (status === 302 && method === 'POST')) {
           method = 'GET';
           body = undefined;
-          contentType = undefined;
         }
         continue;
       }
 
-      const raw = Buffer.from(await res.arrayBuffer());
-      const text = this.decode(raw, res.headers.get('content-encoding'));
+      const contentType = res.headers.get('content-type');
+      const buffer = await readBodyLimited(res, maxBytes);
       log.info(`http ${method} ${current} -> ${status} (${Date.now() - started}ms)`);
-      return { status, text, finalUrl: current };
+      return { status, ok: status >= 200 && status < 300, buffer, contentType, finalUrl: current };
     }
     throw new Error('Too many redirects');
   }
 
-  private decode(buf: Buffer, _encoding: string | null): string {
+  private decode(buf: Buffer): string {
     // Node's undici fetch transparently decompresses gzip/br/deflate while keeping
     // the Content-Encoding header, so the body is already plain bytes here.
     return iconv.decode(buf, 'windows-1251');
   }
+}
+
+// Читает тело ответа с лимитом байт (защита от OOM при SSRF/неожиданно большом теле).
+async function readBodyLimited(res: import('undici').Response, maxBytes: number): Promise<Buffer> {
+  const len = res.headers.get('content-length');
+  if (len !== null) {
+    const n = Number(len);
+    if (Number.isFinite(n) && n > maxBytes) throw new Error('Response body too large');
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  if (!res.body) return Buffer.alloc(0);
+  for await (const chunk of Readable.fromWeb(res.body as never)) {
+    total += chunk.length;
+    if (total > maxBytes) throw new Error('Response body too large');
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
 }
 
 export function formUrlEncode(fields: Record<string, string>): string {

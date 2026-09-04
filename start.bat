@@ -6,6 +6,9 @@ cd /d "%~dp0"
 rem Use bundled Node from the app folder (no system install).
 set "PATH=%~dp0runtime\node;%PATH%"
 
+rem Production mode: JSON errors, no stack traces over HTTP.
+set "NODE_ENV=production"
+
 rem Point Playwright at the self-contained Chromium only if it was downloaded.
 if exist "%~dp0runtime\playwright-browsers\chromium-1234" set "PLAYWRIGHT_BROWSERS_PATH=%~dp0runtime\playwright-browsers"
 
@@ -27,6 +30,15 @@ if not exist "node_modules\" (
 
 rem ---- Close existing server instance if already running ----
 echo Checking for existing server instance...
+rem If a healthy server is already up (e.g. managed by the tray panel) we do NOT kill it,
+rem otherwise the panel and start.bat would fight over the port / data dirs.
+powershell -NoProfile -Command "$h = try { (Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/api/health' -TimeoutSec 2).StatusCode } catch { 0 }; if ($h -eq 200) { Write-Host 'Server already healthy on :3000 - skip.'; exit 7 }"
+if %errorlevel% EQU 7 (
+    echo.
+    echo Server already running, likely managed by the tray panel. Open http://localhost:3000
+    pause
+    exit /b 0
+)
 powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match 'dist[\\/]index\.js|src[\\/]index\.ts' } | ForEach-Object { Write-Host ('Closing server PID ' + $_.ProcessId); taskkill /F /T /PID $_.ProcessId > $null 2>&1 }"
 timeout /t 2 /nobreak >nul
 

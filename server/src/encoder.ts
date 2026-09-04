@@ -15,12 +15,18 @@ export interface EncoderConfig {
   hwaccelArgs(): string[];
   // Аргументы видеокодера (после `-map 0:v:0`).
   videoArgs(gop: number, segmentSec: number): string[];
+  // Аргументы `-vf` (конвертация формата / даунскейл). NVENC держит всю цепочку
+  // на GPU (scale_cuda), остальные — прежний CPU-scale.
+  filterArgs(opts: { height: number | null; res: number | null }): string[];
 }
 
 const NVENC: EncoderConfig = {
   kind: 'nvenc',
   label: 'NVENC',
-  hwaccelArgs: () => ['-hwaccel', 'cuda'],
+  // Декод и конвертация 10-bit -> 8-bit остаются в VRAM (-hwaccel_output_format
+  // cuda + scale_cuda), иначе p010le -> yuv420p гонится через CPU swscale на 4K
+  // (~250 млн пикселей/с) и транскод не успевает за реальным временем.
+  hwaccelArgs: () => ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'],
   videoArgs: (gop) => [
     '-c:v', 'h264_nvenc',
     // p4 быстрее p5, cq выше — больше запаса для 4K в реальном времени.
@@ -30,8 +36,15 @@ const NVENC: EncoderConfig = {
     '-cq', '26',
     '-g', String(gop),
     '-forced-idr', '1',
-    '-pix_fmt', 'yuv420p',
   ],
+  filterArgs: ({ height, res }) => {
+    // scale_cuda выводит nv12 (8-bit) — h264_nvenc берёт кадры прямо из VRAM.
+    const vf =
+      res && height && res < height
+        ? `scale_cuda=-2:${res}:format=nv12`
+        : 'scale_cuda=format=nv12';
+    return ['-vf', vf];
+  },
 };
 
 // QSV-устройство: ffmpeg 5+ требует явный `-init_hw_device` для аппаратного кодера.
@@ -56,6 +69,8 @@ const QSV: EncoderConfig = {
     '-forced_idr', '1',
     '-pix_fmt', 'yuv420p',
   ],
+  filterArgs: ({ height, res }) =>
+    res && height && res < height ? ['-vf', `scale=-2:${res}`] : [],
 };
 
 const LIBX264: EncoderConfig = {
@@ -68,6 +83,8 @@ const LIBX264: EncoderConfig = {
     '-g', String(gop), '-keyint_min', String(gop), '-sc_threshold', '0',
     '-force_key_frames', `expr:gte(t,n_forced*${segmentSec})`,
   ],
+  filterArgs: ({ height, res }) =>
+    res && height && res < height ? ['-vf', `scale=-2:${res}`] : [],
 };
 
 function configFor(kind: EncoderKind): EncoderConfig {

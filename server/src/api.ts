@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import fs from 'node:fs';
 import { ImageFetchError } from './images.js';
 import { Readable } from 'node:stream';
@@ -7,16 +8,25 @@ import { log } from './logger.js';
 import { mimeFor, parseRangeHeader } from './stream-utils.js';
 import { formatWindowVtt } from './mkv.js';
 import { perf } from './perf.js';
+import { assertSafeHttpUrl } from './url-safe.js';
 import { THUMB_INTERVAL_SEC, THUMB_NEAREST_WINDOW_SLOTS } from './thumbnails.js';
 
 // Кэп на один Direct Play ответ: браузер просит `bytes=0-` (весь файл), но мы
 // отдаём только ограниченный кусок, чтобы WebTorrent не выбирал весь файл сразу.
 const MAX_READ_BYTES = 16 * 1024 * 1024;
 
+// Express 4 не ловит reject из async-хендлеров. Обёртка переправляет ошибку в
+// error-middleware (index.ts), который отвечает JSON и не роняет процесс.
+function ah(fn: (req: Request, res: Response) => Promise<unknown>): RequestHandler {
+  return (req: Request, res: Response, next: NextFunction) => {
+    fn(req, res).catch(next);
+  };
+}
+
 export function createApi(services: Services): Router {
   const api = Router();
 
-  api.post('/client-log', async (req, res) => {
+  api.post('/client-log', ah(async (req, res) => {
     const b = (req.body ?? {}) as Record<string, unknown>;
     log.warn(
       `[client] ${String(b.msg ?? 'error')} :: ${JSON.stringify(b).slice(0, 4000)}`,
@@ -48,7 +58,7 @@ export function createApi(services: Services): Router {
     }
 
     res.json({ ok: true });
-  });
+  }));
 
   // Метрики производительности: сервер пишет сам, клиент шлёт свои (seek/stall).
   api.get('/perf', (_req, res) => {
@@ -70,7 +80,7 @@ export function createApi(services: Services): Router {
     res.json({ ok: true });
   });
 
-  api.get('/auth/status', async (_req, res) => {
+  api.get('/auth/status', ah(async (_req, res) => {
     const session = services.store.getSession();
     if (!session || !session.username) {
       res.json({ loggedIn: false, username: null });
@@ -78,14 +88,14 @@ export function createApi(services: Services): Router {
     }
     const loggedIn = await services.auth.ensureLoggedIn();
     res.json({ loggedIn, username: loggedIn ? session.username : null });
-  });
+  }));
 
   // Фаза текущего логина для кнопки в UI: 'cloudflare' | 'login' | 'idle'.
   api.get('/auth/progress', (_req, res) => {
     res.json({ phase: services.browser.getLoginPhase() });
   });
 
-  api.post('/auth/login', async (req, res) => {
+  api.post('/auth/login', ah(async (req, res) => {
     const { username, password } = (req.body ?? {}) as { username?: unknown; password?: unknown };
     if (!username || !password) {
       res.status(400).json({ ok: false, error: 'Нужны логин и пароль.' });
@@ -93,9 +103,9 @@ export function createApi(services: Services): Router {
     }
     const result = await services.auth.login(String(username), String(password));
     res.json(result);
-  });
+  }));
 
-  api.post('/auth/cookies', async (req, res) => {
+  api.post('/auth/cookies', ah(async (req, res) => {
     const { cookie } = (req.body ?? {}) as { cookie?: unknown };
     if (!cookie) {
       res.status(400).json({ ok: false, error: 'Нужна cookie-строка.' });
@@ -103,12 +113,12 @@ export function createApi(services: Services): Router {
     }
     const result = await services.auth.loginWithCookie(String(cookie));
     res.json(result);
-  });
+  }));
 
-  api.post('/auth/logout', async (_req, res) => {
+  api.post('/auth/logout', ah(async (_req, res) => {
     await services.auth.logout();
     res.json({ ok: true });
-  });
+  }));
 
   api.get('/search', async (req, res) => {
     const q = String(req.query.q ?? '').trim();
@@ -185,7 +195,7 @@ export function createApi(services: Services): Router {
     }
   });
 
-  api.post('/topic/:id/stream/stop', async (req, res) => {
+  api.post('/topic/:id/stream/stop', ah(async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) {
       res.status(400).json({ error: 'bad id' });
@@ -193,7 +203,7 @@ export function createApi(services: Services): Router {
     }
     await services.stopStream(id);
     res.json({ ok: true });
-  });
+  }));
 
   api.post('/topic/:id/stream/:fileIndex/hls/stop', async (req, res) => {
     const id = Number(req.params.id);
@@ -344,7 +354,12 @@ export function createApi(services: Services): Router {
     if (p && fs.existsSync(p)) {
       res.setHeader('Content-Type', 'image/jpeg');
       res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-      fs.createReadStream(p).pipe(res);
+      const rs = fs.createReadStream(p);
+      // Файл может быть удалён конкурентной чисткой кеша — не роняем процесс.
+      rs.on('error', () => {
+        if (!res.writableEnded) res.destroy();
+      });
+      rs.pipe(res);
       return;
     }
     const m = /^thumb(\d{6})\.jpg$/.exec(name);
@@ -508,18 +523,60 @@ export function createApi(services: Services): Router {
       res.status(400).json({ error: 'bad params' });
       return;
     }
+    const seg = String(req.params.seg);
     const session = services.hls.sessionById(sessionId);
     const p =
       session && session.topicId === id && session.fileIndex === fileIndex
-        ? services.hls.segmentPath(session, String(req.params.seg))
+        ? services.hls.segmentPath(session, seg)
         : null;
-    if (!p || !fs.existsSync(p)) {
+    if (!session || !p) {
+      log.warn(
+        `[hls-seg] ${id}:${fileIndex} ${seg} 404 session=${session ? session.state : 'missing'} path=${p ?? 'null'} (sessionId=${sessionId.slice(0, 8)})`,
+      );
       res.status(404).end();
       return;
     }
+    if (!fs.existsSync(p)) {
+      let size = -1;
+      try {
+        size = fs.statSync(p).size;
+      } catch {
+        /* ignore */
+      }
+      log.warn(
+        `[hls-seg] ${id}:${fileIndex} ${seg} 404 nofile state=${session.state} proc=${session.proc ? 'alive' : 'gone'} size=${size}`,
+      );
+      res.status(404).end();
+      return;
+    }
+    if (session.state !== 'active') {
+      log.warn(
+        `[hls-seg] ${id}:${fileIndex} ${seg} serve from ${session.state} session (proc=${session.proc ? 'alive' : 'gone'})`,
+      );
+    }
+    // Пока читаем сегменты сессии, каталог нельзя перезаписывать/удалять
+    // (reuse-рестарт ждёт ухода читателей) — иначе клиенту прилетает лавина 404.
+    services.hls.retainSession(session.sessionId);
+    const startedAt = Date.now();
+    let released = false;
+    const onDone = () => {
+      if (released) return;
+      released = true;
+      services.hls.releaseSession(session.sessionId);
+      const ms = Date.now() - startedAt;
+      if (ms > 3000) {
+        log.warn(`[hls-seg] ${id}:${fileIndex} ${seg} slow serve ${ms}ms state=${session.state}`);
+      }
+    };
+    res.on('finish', onDone);
+    res.on('close', onDone);
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-    fs.createReadStream(p).pipe(res);
+    const rs = fs.createReadStream(p);
+    rs.on('error', () => {
+      if (!res.writableEnded) res.destroy();
+    });
+    rs.pipe(res);
   });
 
   api.get('/topic/:id/stream/:fileIndex', async (req, res) => {
@@ -577,6 +634,17 @@ export function createApi(services: Services): Router {
         res.setHeader('Content-Length', String(size));
       }
 
+      // Торрент может быть остановлен/уничтожен во время стрима — не даём ошибке
+      // стрима уронить процесс (unhandled 'error').
+      stream.on('error', () => {
+        if (!res.writableEnded) {
+          try {
+            res.destroy();
+          } catch {
+            /* ignore */
+          }
+        }
+      });
       stream.pipe(res);
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'stream error';
@@ -621,15 +689,15 @@ export function createApi(services: Services): Router {
     res.json({ history: services.store.removeHistory(id) });
   });
 
-  api.get('/cache/size', (_req, res) => {
-    res.json({ bytes: services.store.cacheSize() });
+  api.get('/cache/size', async (_req, res) => {
+    res.json({ bytes: await services.store.cacheSizeAsync() });
   });
 
   api.post('/cache/clear', async (_req, res) => {
     try {
-      const before = services.store.cacheSize();
+      const before = await services.store.cacheSizeAsync();
       await services.clearCache();
-      const after = services.store.cacheSize();
+      const after = await services.store.cacheSizeAsync();
       res.json({ bytes: after, freed: Math.max(0, before - after) });
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'cache clear error';
@@ -639,9 +707,9 @@ export function createApi(services: Services): Router {
 
   api.post('/cache/clear-video', async (_req, res) => {
     try {
-      const before = services.store.cacheSize();
+      const before = await services.store.cacheSizeAsync();
       await services.clearVideoCache();
-      const after = services.store.cacheSize();
+      const after = await services.store.cacheSizeAsync();
       res.json({ bytes: after, freed: Math.max(0, before - after) });
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'video cache clear error';
@@ -649,13 +717,32 @@ export function createApi(services: Services): Router {
     }
   });
 
-  api.post('/enrich', async (req, res) => {
+  api.post('/enrich', ah(async (req, res) => {
     const ids: number[] = (req.body?.ids ?? [])
       .map((n: unknown) => Number(n))
       .filter((n: number) => Number.isFinite(n) && n > 0);
     const out = await services.enrich(ids);
     res.json(out);
-  });
+  }));
+
+  // Фолбэк при неудаче: пусть браузер попробует загрузить картинку напрямую, но
+  // только если это безопасный публичный URL (не private/loopback — open redirect/SSRF).
+  async function browserFallbackUrl(url: string): Promise<string | null> {
+    if (!/^https?:\/\//i.test(url)) return null;
+    let host = '';
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      return null;
+    }
+    if (/rutracker\.(org|cc)$/i.test(host)) return null; // rutracker — не редиректим
+    try {
+      await assertSafeHttpUrl(url);
+      return url;
+    } catch {
+      return null;
+    }
+  }
 
   api.get('/image', async (req, res) => {
     const url = String(req.query.url ?? '');
@@ -671,33 +758,19 @@ export function createApi(services: Services): Router {
     } catch (e) {
       // Источник вернул 4xx (или картинка уже в негативном кеше): серверный fetch
       // бот-детектится и отдаёт 404, но картинка часто грузится напрямую в браузере.
-      // Поэтому отдаём редирект на исходный URL (пусть браузер попробует), а на
-      // рутрекер-хосте — 404. Без повторного fetch и без засорения лога.
       if (e instanceof ImageFetchError) {
-        let host = '';
-        try {
-          host = new URL(url).hostname;
-        } catch {
-          /* ignore */
-        }
-        if (/^https?:\/\//i.test(url) && !/rutracker\.(org|cc)$/i.test(host)) {
-          res.redirect(302, url);
+        const target = await browserFallbackUrl(url);
+        if (target) {
+          res.redirect(302, target);
         } else {
           res.status(e.status).end();
         }
         return;
       }
       log.error(`[api] image fetch failed: ${e instanceof Error ? e.message : String(e)} :: ${url}`);
-      // Фолбэк: отдаём исходный URL, чтобы браузер загрузил картинку напрямую
-      // (как при ручном переходе — это работает там, где серверный fetch отдаёт 404).
-      let host = '';
-      try {
-        host = new URL(url).hostname;
-      } catch {
-        /* ignore */
-      }
-      if (/^https?:\/\//i.test(url) && !/rutracker\.(org|cc)$/i.test(host)) {
-        res.redirect(302, url);
+      const target = await browserFallbackUrl(url);
+      if (target) {
+        res.redirect(302, target);
       } else {
         res.status(404).end();
       }
@@ -793,10 +866,10 @@ export function createApi(services: Services): Router {
     res.json(services.vpn.status());
   });
 
-  api.post('/vpn/test', async (_req, res) => {
+  api.post('/vpn/test', ah(async (_req, res) => {
     const r = await services.vpn.test();
     res.json(r);
-  });
+  }));
 
   return api;
 }

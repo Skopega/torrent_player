@@ -6,6 +6,7 @@ import { FFMPEG_PATH as ffmpegPath } from './media.js';
 import { log } from './logger.js';
 import { perf } from './perf.js';
 import { getEncoder, getEncoderFallback, type EncoderConfig } from './encoder.js';
+import { Priority } from './scheduler.js';
 import { parseHlsDir, matchesKeep } from './cache-dirs.js';
 import type { StreamManager } from './stream.js';
 import type { SubtitleManager } from './subs.js';
@@ -70,6 +71,14 @@ interface HlsSession {
   media: MediaInfo;
   encoder: EncoderConfig | null;
   transcodedEndSec: number; // абсолютная секунда, до которой уже накодировано
+  fileLength: number; // размер файла (для расчёта prefetch-окна по битрейту)
+  prefetchedSec: number; // докуда уже поднят prefetch-приоритет исходника
+}
+
+interface ProgressTrack {
+  end: number;
+  at: number;
+  warned: boolean;
 }
 
 let sessionSeq = 0;
@@ -77,7 +86,8 @@ let sessionSeq = 0;
 // Округляем startSec до границы сегмента: иначе ключ кеша и позиция HLS-таймлайна
 // разъедутся, и субтитры/зелёная зона начнут «плавать» на доли секунды.
 function roundStartSec(sec: number): number {
-  return Math.max(0, Math.floor(sec / SEGMENT_SECONDS) * SEGMENT_SECONDS);
+  if (!Number.isFinite(sec) || sec <= 0) return 0;
+  return Math.floor(sec / SEGMENT_SECONDS) * SEGMENT_SECONDS;
 }
 
 export class HlsManager {
@@ -85,11 +95,40 @@ export class HlsManager {
   private byId = new Map<string, HlsSession>();
   private activeByFile = new Map<string, string>();
   private playheads = new Map<string, number>();
+  // Дедупликация одновременных start() на один ключ: без неё два запроса создали бы
+  // две сессии и два ffmpeg, пишущих в один каталог.
+  private inFlight = new Map<string, Promise<HlsSession>>();
+  // Каталоги сессий, которые ещё готовятся (созданы, но сессия ещё не в `sessions`).
+  // Нужны, чтобы orphan-скан removeCacheExcept не удалил каталог стартующей сессии.
+  private preparingDirs = new Set<string>();
+  // Число активных HTTP-читателей сессии (playlist/сегменты). Пока читают — нельзя
+  // перезаписывать/удалять каталог, иначе клиент получит лавину 404 и «умрёт».
+  private readers = new Map<string, number>();
+  // Отложенные ре-старты остановленных сессий (ждут, пока уйдут читатели).
+  private reusePending = new Map<string, NodeJS.Timeout>();
+  // Прогресс транскода на сессию (для детекции «завис» ffmpeg) и prefetch-окно.
+  private progress = new Map<string, ProgressTrack>();
+  private keepAheadTimer: NodeJS.Timeout;
 
   constructor(
     private stream: StreamManager,
     private subs: SubtitleManager,
-  ) {}
+  ) {
+    // Пока ffmpeg транскодит, держим приоритет байт исходника впереди головы
+    // транскода (feed читает последовательно; без этого он встаёт на каждом куске).
+    this.keepAheadTimer = setInterval(() => void this.keepAhead(), 4000);
+    this.keepAheadTimer.unref();
+  }
+
+  retainSession(sessionId: string): void {
+    this.readers.set(sessionId, (this.readers.get(sessionId) ?? 0) + 1);
+  }
+
+  releaseSession(sessionId: string): void {
+    const n = (this.readers.get(sessionId) ?? 1) - 1;
+    if (n <= 0) this.readers.delete(sessionId);
+    else this.readers.set(sessionId, n);
+  }
 
   private key(
     topicId: number,
@@ -103,6 +142,32 @@ export class HlsManager {
 
   private fileKey(topicId: number, fileIndex: number): string {
     return `${topicId}:${fileIndex}`;
+  }
+
+  private sessionKey(s: HlsSession): string {
+    return this.key(s.topicId, s.fileIndex, s.audio, s.startSec, s.res);
+  }
+
+  // Если сессия — активная для своего файла, убирает её из activeByFile.
+  private unmapIfActive(s: HlsSession): void {
+    const fk = this.fileKey(s.topicId, s.fileIndex);
+    if (this.activeByFile.get(fk) === this.sessionKey(s)) this.activeByFile.delete(fk);
+  }
+
+  // Удаляет частичный кеш сегментов каталога (init/seg/playlist), оставляя каталог.
+  // Вызов перед ре-транскодом: ffmpeg перезаписывает seg%05d с нуля, и старые файлы
+  // от более длинного прошлого прогона иначе осиротеют/перемешаются с новыми.
+  private clearSegments(dir: string): void {
+    try {
+      for (const e of fs.readdirSync(dir)) {
+        if (e === 'init.mp4' || /^seg\d{5}\.m4s$/.test(e) || e === 'playlist.m3u8' || e === 'playlist.m3u8.tmp') {
+          fs.rmSync(path.join(dir, e), { force: true });
+        }
+      }
+      this.windowsCache.clear();
+    } catch {
+      /* ignore */
+    }
   }
 
   // Освобождает место в кеше HLS: удаляет самые старые неактивные сессии, пока
@@ -135,12 +200,38 @@ export class HlsManager {
   }
 
   async start(topicId: number, fileIndex: number, opts: HlsStartOptions = {}): Promise<HlsSession> {
-    const startTimer = perf.timer('hls.start.ms');
     const audio = opts.audio === undefined ? null : opts.audio;
     const res = opts.res && opts.res > 0 ? opts.res : null;
     const startSec = roundStartSec(opts.startSec ?? 0);
     const key = this.key(topicId, fileIndex, audio, startSec, res);
     const fkey = this.fileKey(topicId, fileIndex);
+
+    // Два одновременных start() на один ключ не должны создавать две сессии/ffmpeg.
+    const inflight = this.inFlight.get(key);
+    if (inflight) return inflight;
+    const p = this.startInternal(topicId, fileIndex, audio, res, startSec, key, fkey);
+    this.inFlight.set(key, p);
+    p.then(
+      () => {
+        if (this.inFlight.get(key) === p) this.inFlight.delete(key);
+      },
+      () => {
+        if (this.inFlight.get(key) === p) this.inFlight.delete(key);
+      },
+    );
+    return p;
+  }
+
+  private async startInternal(
+    topicId: number,
+    fileIndex: number,
+    audio: number | null,
+    res: number | null,
+    startSec: number,
+    key: string,
+    fkey: string,
+  ): Promise<HlsSession> {
+    const startTimer = perf.timer('hls.start.ms');
 
     // Останавливаем ffmpeg остальных сессий этого файла (CPU), но каталоги кеша НЕ удаляем:
     // повторная перемотка в ту же позицию достанет сегменты из кеша мгновенно.
@@ -149,14 +240,17 @@ export class HlsManager {
     const existing = this.sessions.get(key);
     if (existing && existing.state !== 'error') {
       this.activeByFile.set(fkey, key);
-      // Finished — полный кеш (мгновенно); stopped — перекодируем заново с этого места.
+      // Finished — полный кеш (мгновенно). stopped — надо перекодировать заново, но
+      // каталог перезаписываем ТОЛЬКО когда с него никто не читает (иначе 404-шторм).
       if (existing.state !== 'finished' && existing.proc == null) {
-        existing.state = 'active';
-        void this.spawn(existing, existing.startSec);
+        this.scheduleReuseRestart(existing, key);
       }
       return existing;
     }
-    if (existing) this.sessions.delete(key);
+    if (existing) {
+      this.sessions.delete(key);
+      this.byId.delete(existing.sessionId);
+    }
 
     // Начинаем кодировать НОВОЕ видео: удаляем кеш всех остальных видео (других
     // файлов/топиков). Кеш этого же файла (по всем позициям) сохраняем — перемотка
@@ -173,11 +267,16 @@ export class HlsManager {
     const { file } = await this.stream.getFile(topicId, fileIndex);
 
     const dir = path.join(HLS_DIR, `${topicId}_${fileIndex}_${audio ?? 'def'}_${startSec}_${res ?? 'full'}`);
-    fs.mkdirSync(dir, { recursive: true });
+    this.preparingDirs.add(dir);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (e) {
+      this.preparingDirs.delete(dir);
+      throw e instanceof Error ? e : new Error(String(e));
+    }
 
     const gop = Math.max(12, Math.round((media.fps ?? 24) * SEGMENT_SECONDS));
 
-    const { relSec } = await this.scanPlaylist(dir);
     const session: HlsSession = {
       sessionId: `s${++sessionSeq}_${Date.now().toString(36)}`,
       topicId,
@@ -192,11 +291,14 @@ export class HlsManager {
       gop,
       media,
       encoder: null,
-      transcodedEndSec: startSec + relSec,
+      transcodedEndSec: startSec,
+      fileLength: file.length,
+      prefetchedSec: startSec,
     };
     this.sessions.set(key, session);
     this.byId.set(session.sessionId, session);
     this.activeByFile.set(fkey, key);
+    this.preparingDirs.delete(dir);
 
     // Заранее тянем seek-индекс (хвост: MKV Cues / MP4 moov / AVI idx1), чтобы -ss
     // делал быстрый seek, а не полный проход. Не блокируем redirect: ffmpeg сам
@@ -219,7 +321,7 @@ export class HlsManager {
         const be = Math.min(file.length - 1, exactByte + windowForward);
         try {
           await this.stream.prioritizeRange(topicId, fileIndex, bs, be);
-          await this.stream.waitForBytes(topicId, fileIndex, bs, Math.min(be, bs + 8 * 1024 * 1024), 2000);
+          await this.stream.waitForBytes(topicId, fileIndex, bs, Math.min(be, bs + 8 * 1024 * 1024), 8000);
         } catch {
           /* ignore */
         }
@@ -258,14 +360,125 @@ export class HlsManager {
       }
     }
 
-    session.state = 'active';
-    void this.spawn(session, startSec);
-    log.info(
-      `[hls] ${topicId}:${fileIndex} started (transcode, audio=${audio ?? 'default'} start=${startSec} res=${res ?? 'full'})`,
-    );
+    // Диагностика перед spawn: готовы ли байты точки входа и хвоста (Cues).
+    if (startSec > 0 && media.durationSec) {
+      const dur = media.durationSec;
+      const approx = Math.min(file.length - 1, Math.floor((startSec / dur) * file.length));
+      const headReady = await this.stream
+        .areBytesReady(topicId, fileIndex, approx, Math.min(file.length - 1, approx + 2 * 1024 * 1024))
+        .catch(() => false);
+      const tailStart = Math.max(0, file.length - 4 * 1024 * 1024);
+      const tailReady = await this.stream
+        .areBytesReady(topicId, fileIndex, tailStart, file.length - 1)
+        .catch(() => false);
+      log.info(
+        `[hls] diag start=${startSec}s approxByte=${approx} headReady=${headReady} tailReady=${tailReady} readers=${this.readers.get(session.sessionId) ?? 0}`,
+      );
+    }
+
+    if (session.state === 'starting') {
+      session.state = 'active';
+      // Каталог может содержать хвосты от предыдущего (удалённого) прогона с тем же
+      // ключом — затираем, чтобы нумерация seg%05d не смешалась со старыми файлами.
+      this.clearSegments(session.dir);
+      session.transcodedEndSec = startSec;
+      void this.spawn(session, startSec);
+      log.info(
+        `[hls] ${topicId}:${fileIndex} started (transcode, audio=${audio ?? 'default'} start=${startSec} res=${res ?? 'full'})`,
+      );
+    } else {
+      // Сессию остановили во время подготовки (stopFile/stopOthers/abort) — не
+      // запускаем ffmpeg и убираем сессию из карт.
+      this.sessions.delete(key);
+      this.byId.delete(session.sessionId);
+      this.unmapIfActive(session);
+      this.progress.delete(session.sessionId);
+    }
     this.gcCache(dir);
     startTimer();
     return session;
+  }
+
+  // Повторный старт остановленной сессии (тот же ключ): каталог сегментов нельзя
+  // перезаписывать, пока с него кто-то читает — иначе клиент получает лавину 404.
+  // Ждём, пока читатели уйдут, затем чистим каталог и перекодируем заново с startSec.
+  private scheduleReuseRestart(s: HlsSession, key: string): void {
+    if (this.reusePending.has(key)) return;
+    const run = (): void => {
+      this.reusePending.delete(key);
+      const cur = this.sessions.get(key);
+      if (!cur || cur !== s) return; // сессия сменилась/удалена
+      if (cur.proc) return; // уже бежит
+      if (cur.state === 'finished') return; // полный кеш — перезапуск не нужен
+      if ((this.readers.get(cur.sessionId) ?? 0) > 0) {
+        const t = setTimeout(run, 700);
+        this.reusePending.set(key, t);
+        return;
+      }
+      cur.state = 'active';
+      this.clearSegments(cur.dir);
+      cur.transcodedEndSec = cur.startSec;
+      cur.prefetchedSec = cur.startSec;
+      void this.spawn(cur, cur.startSec);
+    };
+    const t = setTimeout(run, 0);
+    this.reusePending.set(key, t);
+  }
+
+  // Периодически: prefetch исходника вперёд от головы транскода (feed читает
+  // последовательно — без этого он встаёт на каждом недостающем куске) и детекция
+  // «зависшего» ffmpeg (транскод не двигается, но процесс жив).
+  private async keepAhead(): Promise<void> {
+    for (const s of this.sessions.values()) {
+      if (s.state !== 'active' || !s.proc) continue;
+      const end = s.transcodedEndSec;
+      const pt = this.progress.get(s.sessionId);
+      if (pt) {
+        if (end > pt.end) {
+          pt.end = end;
+          pt.at = Date.now();
+          pt.warned = false;
+        } else if (!pt.warned && Date.now() - pt.at > 20000 && end > s.startSec) {
+          pt.warned = true;
+          let files = 0;
+          try {
+            for (const e of fs.readdirSync(s.dir)) {
+              if (/^seg\d{5}\.m4s$/.test(e)) files++;
+            }
+          } catch {
+            /* ignore */
+          }
+          log.warn(
+            `[hls] ${s.topicId}:${s.fileIndex} transcode stuck at ${end.toFixed(0)}s (${files} segs on disk, proc ${s.proc ? 'alive' : 'gone'})`,
+          );
+        }
+      } else {
+        this.progress.set(s.sessionId, { end, at: Date.now(), warned: false });
+      }
+
+      const dur = s.media.durationSec ?? 0;
+      if (dur > 0 && s.fileLength > 0) {
+        const horizon = Math.min(dur, end + 150);
+        while (s.prefetchedSec < horizon) {
+          const from = s.prefetchedSec;
+          const to = Math.min(dur, from + 150);
+        const b0 = Math.floor((from / dur) * s.fileLength);
+        const b1 = Math.max(b0, Math.min(s.fileLength - 1, Math.floor((to / dur) * s.fileLength)));
+        try {
+          // Префетч НИЖЕ приоритета SEEK: иначе после перемотки точка seek и окно
+          // префетча (150с) сливаются в один регион SEEK, и webtorrent качает его
+          // rarest-first — куски точки seek приезжают последними среди сотен МБ.
+          await this.stream.prioritizeRange(s.topicId, s.fileIndex, b0, b1, Priority.BUFFER);
+        } catch {
+          /* ignore */
+        }
+          s.prefetchedSec = to;
+        }
+      }
+    }
+    for (const id of this.progress.keys()) {
+      if (!this.byId.has(id)) this.progress.delete(id);
+    }
   }
 
   // Позиция плейхеда, сообщённая клиентом через /stream/status?pos= (для правила
@@ -289,6 +502,9 @@ export class HlsManager {
       session.error = 'ffmpeg не найден.';
       return;
     }
+    // Остановили/удалили сессию до старта (stopSession во время подготовки) —
+    // процесс не поднимаем.
+    if (session.state === 'stopped' || session.state === 'error') return;
     const { topicId, fileIndex, audio, gop, res } = session;
     const media = session.media;
     const hasVideo = Boolean(media.videoCodec);
@@ -298,6 +514,9 @@ export class HlsManager {
     if (!session.encoder) {
       session.encoder = await getEncoder();
     }
+    // Между getEncoder() и spawn сессию могли остановить.
+    const stateAfterEncoder: string = session.state;
+    if (stateAfterEncoder === 'stopped' || stateAfterEncoder === 'error') return;
     const encoder = session.encoder;
 
     const args = ['-hide_banner', '-loglevel', 'warning', '-y', '-fflags', '+genpts'];
@@ -308,11 +527,9 @@ export class HlsManager {
 
     if (hasVideo) {
       args.push('-map', '0:v:0');
-      // Снижение разрешения, если пользователь выбрал потолок ниже исходника.
-      const height = media.height;
-      if (res && height && res < height) {
-        args.push('-vf', `scale=-2:${res}`);
-      }
+      // Конвертация формата (10-bit -> 8-bit) и даунскейл — силами кодера.
+      // NVENC держит это на GPU (scale_cuda), остальные — прежний CPU-scale.
+      args.push(...encoder.filterArgs({ height: media.height, res }));
       args.push(...encoder.videoArgs(gop, SEGMENT_SECONDS));
     }
     if (media.audioCodec) {
@@ -483,6 +700,7 @@ export class HlsManager {
       s.proc = null;
     }
     s.state = 'stopped';
+    this.unmapIfActive(s);
     log.info(`[hls] ${s.topicId}:${s.fileIndex} stopped (cache kept)`);
   }
 
@@ -504,9 +722,10 @@ export class HlsManager {
 
   stopTopic(topicId: number): void {
     for (const [, s] of this.sessions) {
-      if (s.topicId === topicId && s.proc) {
-        this.stopSession(s);
-      }
+      // 'starting'-сессии (proc ещё null) тоже останавливаем: иначе после подготовки
+      // они всё равно заспавнились бы.
+      if (s.topicId === topicId && s.proc) this.stopSession(s);
+      else if (s.topicId === topicId && s.state === 'starting') this.stopSession(s);
     }
   }
 
@@ -514,13 +733,13 @@ export class HlsManager {
     const key = this.activeByFile.get(this.fileKey(topicId, fileIndex));
     if (key) {
       const s = this.sessions.get(key);
-      if (s && s.proc) this.stopSession(s);
+      if (s) this.stopSession(s);
     }
   }
 
   stopOthers(topicId: number, fileIndex: number, exceptKey: string): void {
     for (const [key, s] of this.sessions) {
-      if (s.topicId === topicId && s.fileIndex === fileIndex && key !== exceptKey && s.proc) {
+      if (s.topicId === topicId && s.fileIndex === fileIndex && key !== exceptKey) {
         this.stopSession(s);
       }
     }
@@ -568,6 +787,7 @@ export class HlsManager {
       this.byId.delete(s.sessionId);
       if (this.activeByFile.get(fileKey) === key) this.activeByFile.delete(fileKey);
       this.sessions.delete(key);
+      this.windowsCache.delete(fileKey);
       log.info(`[cache] pruned hls dir ${s.dir}`);
     }
 
@@ -580,10 +800,14 @@ export class HlsManager {
     }
     for (const e of entries) {
       if (!e.isDirectory()) continue;
+      const dir = path.join(HLS_DIR, e.name);
+      // Каталог сессии, которая ещё готовится (создана, но ещё не в sessions) —
+      // не трогаем: её start() продолжит spawn после подготовки.
+      if (this.preparingDirs.has(dir)) continue;
       const ref = parseHlsDir(e.name);
       if (ref && matchesKeep(ref, keepTopicId, keepFileIndex)) continue;
       try {
-        rmDirRobust(path.join(HLS_DIR, e.name));
+        rmDirRobust(dir);
         log.info(`[cache] pruned orphan hls dir ${e.name}`);
       } catch {
         /* ignore */
@@ -615,6 +839,9 @@ export class HlsManager {
   }
 
   // Ждёт, пока ffmpeg запишет первый сегмент (плейлист станет непустым).
+  // НЕ убиваем ffmpeg по таймауту: при перемотке в недокачанный регион первый
+  // сегмент может появиться позже 20 с (ffmpeg ждёт байты feed'а). Убийство
+  // превращало «медленный старт» в livelock stop/restart.
   async waitForPlaylist(s: HlsSession, timeoutMs = 20000): Promise<boolean> {
     const stopTimer = perf.timer('hls.firstSegment.ms');
     const deadline = Date.now() + timeoutMs;
@@ -622,6 +849,11 @@ export class HlsManager {
       if (this.playlistReady(s)) {
         stopTimer();
         return true;
+      }
+      if (s.proc == null && s.state !== 'active') {
+        // ffmpeg не запустился (остановка/ошибка) — ждать нечего.
+        stopTimer();
+        return false;
       }
       await new Promise((r) => setTimeout(r, 300));
     }
@@ -711,6 +943,11 @@ export class HlsManager {
     this.byId.clear();
     this.activeByFile.clear();
     this.windowsCache.clear();
+    clearInterval(this.keepAheadTimer);
+    for (const t of this.reusePending.values()) clearTimeout(t);
+    this.reusePending.clear();
+    this.readers.clear();
+    this.progress.clear();
     await Promise.all(procs.map((p) => HlsManager.waitExit(p, 2000)));
   }
 }

@@ -12,6 +12,9 @@ import { log } from './logger.js';
 import type { StreamManager } from './stream.js';
 
 const TAIL_BYTES = 4 * 1024 * 1024;
+// Верхний предел чтения одного кластера: parseElement может вернуть огромный
+// size на битых/некорректных Cues — не читаем пол-файла одним буфером.
+const MAX_CLUSTER_READ_BYTES = 64 * 1024 * 1024;
 
 // Запросно-ориентированный экстрактор субтитров: читает MKV-структуру (Tracks,
 // Cues) один раз на файл и для окна времени достаёт субтитрные блоки из кластеров
@@ -93,7 +96,7 @@ export class SubtitleManager {
     dur: number,
     language?: string | null,
   ): Promise<{ cues: SubtitleCue[]; done: boolean }> {
-    const key = `${fileIndex}:${trackPosition}:${t}:${dur}`;
+    const key = `${topicId}:${fileIndex}:${trackPosition}:${t}:${dur}`;
     const mem = this.memo.get(key);
     if (mem && mem.done && Date.now() - mem.at < 10 * 60 * 1000) {
       return { cues: mem.cues, done: true };
@@ -123,11 +126,16 @@ export class SubtitleManager {
         continue;
       }
       const el = parseElement(header, 0);
-      let size = el.ok ? el.size : 0;
-      if (!size || size <= 0) {
-        const next = clusters[i + 1];
-        size = next ? next.clusterPos - c.clusterPos : 0;
-      }
+      // Реальный размер кластера не больше расстояния до следующего; страховка от
+      // мусорного el.size (битые Cues/позиция не на начале Cluster) и от гигантских
+      // значений: читаем максимум до следующего кластера и не более MAX_CLUSTER_READ.
+      const next = clusters[i + 1];
+      const upper = Math.min(
+        next ? next.clusterPos - c.clusterPos : MAX_CLUSTER_READ_BYTES,
+        MAX_CLUSTER_READ_BYTES,
+      );
+      const rawSize = el.ok && el.size > 0 ? el.size : upper;
+      const size = Math.min(rawSize, upper);
       if (size <= 0) {
         done = false;
         continue;
@@ -197,16 +205,22 @@ export class SubtitleManager {
     for (const key of this.indexCache.keys()) {
       if (key.startsWith(`${topicId}:`)) this.indexCache.delete(key);
     }
+    for (const key of this.failUntil.keys()) {
+      if (key.startsWith(`${topicId}:`)) this.failUntil.delete(key);
+    }
     this.memo.clear();
   }
 
   stopFile(topicId: number, fileIndex: number): void {
-    this.indexCache.delete(this.indexKey(topicId, fileIndex));
+    const key = this.indexKey(topicId, fileIndex);
+    this.indexCache.delete(key);
+    this.failUntil.delete(key);
     this.memo.clear();
   }
 
   stopAll(): void {
     this.indexCache.clear();
+    this.failUntil.clear();
     this.memo.clear();
   }
 }

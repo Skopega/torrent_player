@@ -17,6 +17,13 @@ export function PosterCard({
       onClick={() => onOpen(r.id)}
       onMouseEnter={() => onPrefetch(r.id)}
       onFocus={() => onPrefetch(r.id)}
+      onKeyDown={(ev) => {
+        if (ev.target !== ev.currentTarget) return;
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault();
+          onOpen(r.id);
+        }
+      }}
       role="button"
       tabIndex={0}
     >

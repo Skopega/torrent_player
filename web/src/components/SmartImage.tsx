@@ -19,6 +19,8 @@ export function SmartImage({ src, alt }: { src: string | null; alt?: string }) {
   const [failed, setFailed] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  const retryTimer = useRef<number | null>(null);
+  const currentSrc = useRef<string | null>(null);
 
   useEffect(() => {
     const el = ref.current;
@@ -37,10 +39,21 @@ export function SmartImage({ src, alt }: { src: string | null; alt?: string }) {
   }, []);
 
   useEffect(() => {
+    currentSrc.current = src;
+    if (retryTimer.current != null) {
+      window.clearTimeout(retryTimer.current);
+      retryTimer.current = null;
+    }
     setFailed(false);
     setLoaded(false);
     setAttempt(0);
   }, [src]);
+
+  useEffect(() => {
+    return () => {
+      if (retryTimer.current != null) window.clearTimeout(retryTimer.current);
+    };
+  }, []);
 
   if (!src || failed) {
     return (
@@ -61,7 +74,11 @@ export function SmartImage({ src, alt }: { src: string | null; alt?: string }) {
           onLoad={() => setLoaded(true)}
           onError={() => {
             if (attempt < 1) {
-              window.setTimeout(() => setAttempt((a) => a + 1), 300);
+              retryTimer.current = window.setTimeout(() => {
+                retryTimer.current = null;
+                // Не ретраить новый src по ошибке старого (src мог смениться за 300 мс).
+                if (currentSrc.current === src) setAttempt((a) => a + 1);
+              }, 300);
             } else {
               setFailed(true);
             }

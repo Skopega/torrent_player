@@ -85,7 +85,22 @@ export class TorrentScheduler {
     this.dirty = true;
   }
 
+  // Внешний код снял выбор (file.deselect()/torrent.deselect() в обход планировщика).
+  // Помечаем эти куски как «не применено», чтобы следующий commit() пере-выбрал их,
+  // если desired всё ещё требует (иначе планировщик «забывает» про снятые интервалы).
+  externalDeselect(first: number, last: number): void {
+    const r = this.clamp(first, last);
+    if (r.last < r.first) return;
+    for (let i = r.first; i <= r.last; i++) {
+      if (this.applied[i] !== 0) {
+        this.applied[i] = 0;
+        this.dirty = true;
+      }
+    }
+  }
+
   commit(): void {
+    if (this.torrent.destroyed) return;
     if (!this.dirty) return;
     this.dirty = false;
     const n = this.desired.length;
@@ -107,8 +122,12 @@ export class TorrentScheduler {
       for (let k = i; k <= j && !hadApplied; k++) {
         if (this.applied[k] !== 0) hadApplied = true;
       }
-      if (hadApplied) this.torrent.deselect(i, j);
-      if (newP > 0) this.torrent.select(i, j, newP);
+      try {
+        if (hadApplied) this.torrent.deselect(i, j);
+        if (newP > 0) this.torrent.select(i, j, newP);
+      } catch {
+        // Торрент мог быть уничтожен между проверкой и вызовом — игнорируем.
+      }
 
       for (let k = i; k <= j; k++) this.applied[k] = newP;
       i = j + 1;

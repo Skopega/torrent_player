@@ -108,14 +108,6 @@ function readUint(buf: Buffer, pos: number, size: number): number {
   return v;
 }
 
-function readInt(buf: Buffer, pos: number, size: number): number {
-  let v = readUint(buf, pos, size);
-  const bits = size * 8;
-  const sign = 1 << (bits - 1);
-  if (v & sign) v -= 1 << bits;
-  return v;
-}
-
 export class MkvIndex {
   constructor(
     readonly segmentDataPos: number,
@@ -176,8 +168,11 @@ export function findSegment(buf: Buffer): { segDataPos: number; segSize: number 
   let pos = 0;
   while (pos + 4 <= buf.length) {
     const el = parseElement(buf, pos);
-    if (!el.ok || el.size <= 0) return null;
+    // Размер Segment может быть unknown (все биты vint = 1) у live/pipe-мьюксеров —
+    // parseElement возвращает size=0. Для поиска нужен только dataPos, отказ не нужен.
+    if (!el.ok) return null;
     if (el.id === ID_SEGMENT) return { segDataPos: el.dataPos, segSize: el.size };
+    if (el.size <= 0) return null;
     pos = el.dataPos + el.size;
   }
   return null;
@@ -389,7 +384,9 @@ export function parseCluster(clusterBuf: Buffer, trackNumber: number): ParsedBlo
     if (!el.ok || el.size <= 0) break;
     const end = Math.min(el.dataPos + el.size, clusterBuf.length);
     if (el.id === ID_CLUSTER_TIMECODE) {
-      clusterTimecode = readInt(clusterBuf, el.dataPos, Math.min(el.size, 8));
+      // Cluster Timestamp в Matroska — беззнаковый («Must be not negative»).
+      // Знаковое чтение превращало таймкод 40000 мс (0x9C40) в −25536.
+      clusterTimecode = readUint(clusterBuf, el.dataPos, Math.min(el.size, 8));
     } else if (el.id === ID_SIMPLE_BLOCK) {
       const b = parseBlock(clusterBuf, el.dataPos, end);
       if (b) blocks.push(b);

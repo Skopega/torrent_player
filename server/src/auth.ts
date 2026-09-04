@@ -33,11 +33,14 @@ export class Auth {
 
     if (result.ok) {
       const cookies = await this.browser.getCookies();
+      // Пароль не храним на диске (cookies-only): при протухании сессии UI
+      // попросит ввести его заново.
       this.store.setSession({
         username: result.username ?? username,
-        password,
         cookies,
       });
+      // Негативный кеш картинок мог накопиться от протухшей сессии (401/бот-404).
+      this.store.clearFailedImages();
       this.loggedInCache = true;
       log.info(`[auth] login ok as "${result.username}"`);
       return { ok: true, username: result.username ?? username };
@@ -68,9 +71,9 @@ export class Auth {
     const session = this.store.getSession();
     this.store.setSession({
       username: session?.username ?? status.username ?? '',
-      password: session?.password ?? '',
       cookies: await this.browser.getCookies(),
     });
+    this.store.clearFailedImages();
     return { ok: true, username: status.username ?? undefined };
   }
 
@@ -97,11 +100,9 @@ export class Auth {
       return true;
     }
 
+    // Пароль не хранится (cookies-only) — автологина нет. Пользователь заново
+    // входит через UI, когда куки rutracker протухают.
     this.loggedInCache = false;
-    if (session && session.username && session.password) {
-      const res = await this.login(session.username, session.password);
-      return res.ok;
-    }
     return false;
   }
 }

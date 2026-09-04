@@ -155,6 +155,14 @@ export function Player({ topicId }: { topicId: number }) {
     pos: 0,
     res: null,
   });
+  // Счётчик попыток recovery текущей HLS-сессии (сбрасывается при новой сессии).
+  const hlsRetriesRef = useRef(0);
+  // Сторож нефатальных таймаутов/сталлов (fragLoadTimeOut и т.п.): серия событий в
+  // коротком окне = клин после перемотки — принудительно перезапускаем загрузку.
+  const stallWatchRef = useRef<{ count: number; lastAt: number }>({ count: 0, lastAt: 0 });
+  // Какому fileIndex соответствует текущий media (гейт HLS-эффекта против гонки
+  // «новый fileIndex + старый media» при переключении эпизодов).
+  const mediaFileRef = useRef<number | null>(null);
 
   const [files, setFiles] = useState<StreamFile[] | null>(null);
   const [fileIndex, setFileIndex] = useState<number | null>(null);
@@ -163,6 +171,8 @@ export function Player({ topicId }: { topicId: number }) {
   const [transcodedSec, setTranscodedSec] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Инкремент пересоздаёт HLS-сессию (кнопка «Повторить» после фатальной ошибки).
+  const [retryNonce, setRetryNonce] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [buffering, setBuffering] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
@@ -241,6 +251,11 @@ export function Player({ topicId }: { topicId: number }) {
     setSessionStart(0);
     setSubWindowStart(0);
     setTranscodedSec(null);
+    // Смена файла = новая попытка: сбрасываем прошлую ошибку (иначе «мёртвый» экран
+    // остаётся навсегда и блокирует переключение эпизодов).
+    setError(null);
+    setRetryNonce((n) => n + 1);
+    mediaFileRef.current = null;
     api
       .streamProbe(topicId, fileIndex)
       .then((m) => {
@@ -250,6 +265,7 @@ export function Player({ topicId }: { topicId: number }) {
         setSubSel(0);
         // По умолчанию — максимальное качество (выше исходника сервер и так не масштабирует).
         setResSel(maxResFor(m.height));
+        mediaFileRef.current = fileIndex;
         setMedia(m);
         setLoading(false);
       })
@@ -272,6 +288,11 @@ export function Player({ topicId }: { topicId: number }) {
   useEffect(() => {
     const video = videoRef.current;
     if (!video || fileIndex == null || !media) return;
+    // Гонка при смене эпизода: media ещё от старого файла — не стартуем сессию с
+    // неверными audio/res, пока не придёт probe нового файла.
+    if (mediaFileRef.current !== fileIndex) return;
+    hlsRetriesRef.current = 0;
+    stallWatchRef.current = { count: 0, lastAt: 0 };
 
     if (hlsRef.current) {
       hlsRef.current.destroy();
@@ -298,13 +319,14 @@ export function Player({ topicId }: { topicId: number }) {
     } else if (Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
-        // Буфер до 10 минут вперёд: меньше фризов при просадках закачки/транскода.
-        maxBufferLength: 600,
-        maxMaxBufferLength: 600,
+        // Буфер вперёд ограничиваем и по времени, и по байтам: maxBufferSize:0 +
+        // 600 с (600 МБ+) вызывали bufferFullError/риск памяти на слабых машинах.
+        maxBufferLength: 120,
+        maxMaxBufferLength: 240,
         backBufferLength: 60,
-        maxBufferSize: 0,
-        fragLoadingTimeOut: 20000,
-        fragLoadingMaxRetry: 6,
+        maxBufferSize: 256 * 1024 * 1024,
+        fragLoadingTimeOut: 8000,
+        fragLoadingMaxRetry: 3,
         fragLoadingRetryDelay: 500,
         manifestLoadingTimeOut: 20000,
         manifestLoadingMaxRetry: 2,
@@ -331,11 +353,56 @@ export function Player({ topicId }: { topicId: number }) {
           };
         }
         api.clientLog(payload);
-        if (data.fatal) {
-          const detail = data.details ? ` (${data.details})` : '';
-          const reason = data.reason ? ` — ${data.reason}` : '';
-          setError(`Ошибка HLS: ${data.type}${detail}${reason}`);
+        if (!data.fatal) {
+          // Нефатальные таймауты/сталлы hls.js сам ретраит, но зацикливается и
+          // «вешает» плеер на минуты (в т.ч. после перемотки). Считаем серию таких
+          // событий и принудительно перезапускаем загрузку (пересинхронизация с
+          // живым краем плейлиста), чтобы выйти из клина.
+          if (
+            data.details === 'fragLoadTimeOut' ||
+            data.details === 'levelLoadTimeOut' ||
+            data.details === 'bufferStalledError'
+          ) {
+            const now = Date.now();
+            const w = stallWatchRef.current;
+            if (now - w.lastAt > 15000) w.count = 0;
+            w.count += 1;
+            w.lastAt = now;
+            if (w.count >= 3) {
+              w.count = 0;
+              window.setTimeout(() => {
+                if (hlsRef.current === hls) {
+                  try {
+                    hls.startLoad();
+                  } catch {
+                    /* ignore */
+                  }
+                }
+              }, 300);
+            }
+          }
+          return;
         }
+        // Каноничный recovery hls.js: кратковременные сетевые/медиа-сбои не должны
+        // «убивать» плеер (торрент-HLS фризит на докачке).
+        if (
+          data.type === Hls.ErrorTypes.NETWORK_ERROR &&
+          hlsRetriesRef.current < 3
+        ) {
+          hlsRetriesRef.current++;
+          window.setTimeout(() => {
+            if (hlsRef.current === hls) hls.startLoad();
+          }, 800);
+          return;
+        }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && hlsRetriesRef.current < 4) {
+          hlsRetriesRef.current++;
+          hls.recoverMediaError();
+          return;
+        }
+        const detail = data.details ? ` (${data.details})` : '';
+        const reason = data.reason ? ` — ${data.reason}` : '';
+        setError(`Ошибка HLS: ${data.type}${detail}${reason}`);
       });
       hls.loadSource(hlsPlaylistUrl(topicId, fileIndex, selectedAbs, sessionStart, resSel));
       hls.attachMedia(video);
@@ -362,7 +429,7 @@ export function Player({ topicId }: { topicId: number }) {
       }
       if (nativeRestore) video.removeEventListener('loadedmetadata', nativeRestore);
     };
-  }, [topicId, fileIndex, media, audioSel, resSel, sessionStart, directPlay, selectedAbs]);
+  }, [topicId, fileIndex, media, audioSel, resSel, sessionStart, directPlay, selectedAbs, retryNonce]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -526,11 +593,15 @@ export function Player({ topicId }: { topicId: number }) {
 
   useEffect(() => {
     if (fileIndex == null) return;
+    const ac = new AbortController();
+    let alive = true;
     const tick = () => {
+      if (!alive) return;
       const o = statusOptsRef.current;
       api
-        .streamStatus(topicId, fileIndex, o)
+        .streamStatus(topicId, fileIndex, o, ac.signal)
         .then((s) => {
+          if (!alive) return;
           setStatus(s);
           setTranscodedSec(s.transcodedSec);
         })
@@ -538,7 +609,11 @@ export function Player({ topicId }: { topicId: number }) {
     };
     tick();
     const iv = window.setInterval(tick, 1500);
-    return () => window.clearInterval(iv);
+    return () => {
+      alive = false;
+      ac.abort();
+      window.clearInterval(iv);
+    };
   }, [topicId, fileIndex]);
 
   useEffect(() => {
@@ -565,14 +640,25 @@ export function Player({ topicId }: { topicId: number }) {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      const target = e.target as HTMLElement | null;
+      // Горячие клавиши не должны перехватываться, когда пользователь работает с
+      // интерактивными элементами: кнопки, поля, меню плеера/страницы.
+      if (target && target.closest) {
+        if (
+          target.closest(
+            'button, a, input, textarea, select, [role="button"], [role="slider"], .player-menu, .player-settings, .player-ep-wrap, .dropdown, .sort-menu',
+          )
+        ) {
+          return;
+        }
+      }
       const video = videoRef.current;
       if (!video) return;
       if (e.key === ' ' || e.key === 'k') {
         e.preventDefault();
         video.paused ? video.play() : video.pause();
       } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
         const delta = e.key === 'ArrowLeft' ? -5 : 5;
         const maxFrag = directPlay
           ? (duration || Infinity)
@@ -815,7 +901,20 @@ const toggleFullscreen = () => {
   };
 
   if (error) {
-    return <div className="player-state">{error}</div>;
+    return (
+      <div className="player-state">
+        <p>{error}</p>
+        <button
+          className="btn"
+          onClick={() => {
+            setError(null);
+            setRetryNonce((n) => n + 1);
+          }}
+        >
+          Повторить
+        </button>
+      </div>
+    );
   }
 
   if (loading || fileIndex == null) {

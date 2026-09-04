@@ -52,6 +52,8 @@ interface Entry {
 const MAX_ACTIVE = 3;
 const IDLE_TTL_MS = 15 * 60 * 1000;
 const PROBE_BYTES = 8 * 1024 * 1024;
+// Таймаут ffprobe: без него чтение недокачанной головы файла висело бы вечно.
+const PROBE_TIMEOUT_MS = 20_000;
 // «Сейчас»-окно, помечаемое critical: только чтобы waitForBytes/readBytes быстрее
 // получали именно нужные куски. Необратимо (webtorrent), поэтому держим небольшим.
 const CRITICAL_WINDOW_BYTES = 8 * 1024 * 1024;
@@ -80,6 +82,8 @@ export class StreamManager {
       if (existing.torrent) {
         if (existing.torrent.paused) {
           existing.torrent.resume();
+          // stop() снял selection'ы через deselect — возвращаем желаемые диапазоны.
+          existing.scheduler?.commit();
           log.info(`[stream] resume topic ${topicId} (reload)`);
         }
         return existing.torrent;
@@ -97,13 +101,20 @@ export class StreamManager {
       lastUsed: Date.now(),
       scheduler: null,
     };
-    entry.pending = this._load(topicId).then((torrent) => {
-      entry.torrent = torrent;
-      entry.pending = null;
-      entry.scheduler = new TorrentScheduler(torrent);
-      this.evictIfNeeded();
-      return torrent;
-    });
+    entry.pending = this._load(topicId)
+      .then((torrent) => {
+        entry.torrent = torrent;
+        entry.pending = null;
+        entry.scheduler = new TorrentScheduler(torrent);
+        this.evictIfNeeded();
+        return torrent;
+      })
+      .catch((err) => {
+        // Отравленная запись (rejected) навсегда блокировала бы топик — удаляем её,
+        // чтобы следующая попытка открыла раздачу заново.
+        if (this.entries.get(topicId) === entry) this.entries.delete(topicId);
+        throw err;
+      });
     this.entries.set(topicId, entry);
     return entry.pending;
   }
@@ -117,36 +128,109 @@ export class StreamManager {
       ? await this.isCompleteOnDisk(torrentId)
       : false;
 
-    return new Promise<Torrent>((resolve, reject) => {
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          reject(new Error('Таймаут загрузки метаданных торрента.'));
-        }
-      }, 60_000);
-
-      let torrent: Torrent;
+    // Инфо-хэш известен заранее только для .torrent (у магнита — после метаданных).
+    let ihash: string | null = null;
+    if (Buffer.isBuffer(torrentId)) {
       try {
-        torrent = this.client.add(torrentId, this.addOptions(skipVerify), (t) => {
+        ihash = (await parseTorrent(torrentId)).infoHash ?? null;
+      } catch {
+        ihash = null;
+      }
+    }
+    if (ihash) {
+      const dup = this.findClientTorrent(ihash);
+      if (dup && !dup.destroyed) {
+        // Дубль в клиенте (другой топик на тот же файл, либо «осиротевший» после
+        // очистки/гонки): уничтожаем без удаления данных с диска и добавляем заново.
+        // Именно это «Cannot add duplicate torrent» очистка кеша не лечит — он живёт
+        // в памяти webtorrent-клиента, а не в файлах.
+        log.warn(`[stream] duplicate infohash ${ihash} in client — destroying stale copy, disk kept`);
+        await this.destroyQuiet(dup, { destroyStore: false });
+      }
+    }
+
+    return this.addWithRetry(topicId, torrentId, skipVerify, ihash);
+  }
+
+  private findClientTorrent(ihash: string): Torrent | undefined {
+    const torrents = (this.client as unknown as { torrents: Torrent[] }).torrents ?? [];
+    return torrents.find((t) => t.infoHash === ihash);
+  }
+
+  private destroyQuiet(t: Torrent, opts?: { destroyStore?: boolean }): Promise<void> {
+    if (t.destroyed) return Promise.resolve();
+    return new Promise<void>((res) => {
+      try {
+        t.destroy(opts ?? {}, () => res());
+      } catch {
+        res();
+      }
+    });
+  }
+
+  // Добавление с авто-лечением дубля: если в момент add в клиент уже попал тот же
+  // инфо-хэш (гонка двух параллельных загрузок одного файла под разными топиками) —
+  // уничтожаем старую копию (без потери диска) и повторяем один раз.
+  private async addWithRetry(
+    topicId: number,
+    torrentId: Buffer | string,
+    skipVerify: boolean,
+    ihash: string | null,
+  ): Promise<Torrent> {
+    const attempt = (): Promise<Torrent> =>
+      new Promise<Torrent>((resolve, reject) => {
+        let settled = false;
+        let torrentRef: Torrent | null = null;
+
+        const fail = (err: unknown) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
-          resolve(t);
-        });
-      } catch (e) {
-        clearTimeout(timer);
-        reject(e instanceof Error ? e : new Error(String(e)));
-        return;
-      }
+          try {
+            torrentRef?.destroy(() => {});
+          } catch {
+            /* ignore */
+          }
+          reject(err instanceof Error ? err : new Error(String(err)));
+        };
 
-      torrent.on('error', (err) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(err instanceof Error ? err : new Error(String(err)));
+        const timer = setTimeout(() => {
+          fail(new Error('Таймаут загрузки метаданных торрента.'));
+        }, 60_000);
+
+        let torrent: Torrent;
+        try {
+          torrent = this.client.add(torrentId, this.addOptions(skipVerify), (_t) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(_t);
+          });
+          torrentRef = torrent;
+        } catch (e) {
+          fail(e);
+          return;
+        }
+
+        torrent.on('error', (err) => {
+          fail(err);
+        });
       });
-    });
+
+    try {
+      return await attempt();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/duplicate/i.test(msg) && ihash) {
+        const dup = this.findClientTorrent(ihash);
+        if (dup) {
+          log.warn(`[stream] add raced with duplicate ${ihash} — retry after cleanup`);
+          await this.destroyQuiet(dup, { destroyStore: false });
+          return attempt();
+        }
+      }
+      throw e;
+    }
   }
 
   // Проверяет, полностью ли раздача уже лежит на диске (тогда не перепроверяем куски).
@@ -155,10 +239,15 @@ export class StreamManager {
       const parsed = await parseTorrent(torrentBuf);
       if (!parsed.infoHash || !parsed.length || !parsed.files?.length) return false;
       const dir = path.join(TORRENT_DIR, `${parsed.name} - ${parsed.infoHash.slice(0, 8)}`);
+      const root = path.resolve(dir);
+      const stat = fs.promises.stat;
       let total = 0;
       for (const f of parsed.files) {
         try {
-          total += fs.statSync(path.join(dir, f.path)).size;
+          const p = path.resolve(root, f.path);
+          // Пути из торрента не должны выходить за пределы каталога раздачи.
+          if (p !== root && !p.startsWith(root + path.sep)) return false;
+          total += (await stat(p)).size;
         } catch {
           return false;
         }
@@ -227,6 +316,7 @@ export class StreamManager {
       const victim = ready.shift();
       if (!victim || !victim.torrent) break;
       this.entries.delete(victim.topicId);
+      this.playWindows.delete(victim.topicId);
       log.info(`[stream] evict topic ${victim.topicId} (over limit)`);
       victim.torrent.destroy({ destroyStore: true }, () => {});
     }
@@ -237,6 +327,7 @@ export class StreamManager {
     for (const [id, entry] of this.entries) {
       if (entry.torrent && now - entry.lastUsed > IDLE_TTL_MS) {
         this.entries.delete(id);
+        this.playWindows.delete(id);
         log.info(`[stream] evict topic ${id} (idle)`);
         entry.torrent.destroy({ destroyStore: true }, () => {});
       }
@@ -297,23 +388,36 @@ export class StreamManager {
     const entry = this.entries.get(topicId);
     const t = entry?.torrent;
     if (!t || t.destroyed) return;
-    this._stopTorrent(t);
+    this._stopTorrent(topicId, t);
     log.info(`[stream] stop topic ${topicId}`);
   }
 
   private stopAllExcept(topicId: number): void {
     for (const [id, entry] of this.entries) {
       if (id !== topicId && entry.torrent && !entry.torrent.destroyed) {
-        this._stopTorrent(entry.torrent);
+        this._stopTorrent(id, entry.torrent);
         log.info(`[stream] stop topic ${id} (new active)`);
       }
     }
   }
 
-  private _stopTorrent(t: Torrent): void {
+  // Снимает выбор со всех файлов и паузит торрент. Сообщает планировщику, что
+  // реальные selection'ы сняты, чтобы последующий commit()/resume вернул желаемое.
+  private _stopTorrent(topicId: number, t: Torrent): void {
     try {
       t.pause();
-      for (const f of t.files) f.deselect();
+      const sched = this.schedulerFor(topicId);
+      for (const f of t.files) {
+        if (f.length > 0) {
+          const r = pieceRange(f.offset, 0, f.length - 1, t.pieceLength);
+          try {
+            f.deselect();
+          } catch {
+            /* ignore */
+          }
+          sched?.externalDeselect(r.first, r.last);
+        }
+      }
     } catch {
       /* ignore */
     }
@@ -325,9 +429,23 @@ export class StreamManager {
     if (!t || t.destroyed) return;
     try {
       t.resume();
+      const sched = this.schedulerFor(topicId);
       for (let i = 0; i < t.files.length; i++) {
-        if (i !== fileIndex) t.files[i].deselect();
+        if (i !== fileIndex) {
+          const f = t.files[i];
+          if (f.length > 0) {
+            const r = pieceRange(f.offset, 0, f.length - 1, t.pieceLength);
+            try {
+              f.deselect();
+            } catch {
+              /* ignore */
+            }
+            sched?.externalDeselect(r.first, r.last);
+          }
+        }
       }
+      // stop() снял selection'ы — возвращаем желаемые (окно плейбека и пр.).
+      sched?.commit();
     } catch {
       /* ignore */
     }
@@ -358,8 +476,22 @@ export class StreamManager {
     opts: OpenStreamOptions = {},
   ): Promise<{ torrent: Torrent; file: TorrentFile; stream: Readable }> {
     const { torrent, file } = await this.getFile(topicId, fileIndex);
+    const scheduler = this.schedulerFor(topicId);
     for (let i = 0; i < torrent.files.length; i++) {
-      if (i !== fileIndex) torrent.files[i].deselect();
+      if (i !== fileIndex) {
+        const other = torrent.files[i];
+        if (other.length > 0) {
+          const r = pieceRange(other.offset, 0, other.length - 1, torrent.pieceLength);
+          try {
+            other.deselect();
+          } catch {
+            /* ignore */
+          }
+          // file.deselect() снимает и selection'ы планировщика — синхронизируем applied,
+          // чтобы возврат на этот файл пере-выбрал желаемые куски (см. TorrentScheduler).
+          scheduler?.externalDeselect(r.first, r.last);
+        }
+      }
     }
 
     // Не выбираем весь файл: поднимаем приоритет запрошенного диапазона и окна
@@ -369,7 +501,6 @@ export class StreamManager {
     // весь файл, а только тянет окно вперёд от плейхеда.
     const start = opts.start ?? 0;
     const end = Math.min(opts.end ?? file.length - 1, file.length - 1);
-    const scheduler = this.schedulerFor(topicId);
     if (scheduler && !opts.feed && end >= start && file.length > 0) {
       // Перемотка/продвижение плейхеда: снимаем прошлое окно, чтобы старый диапазон
       // не продолжал тянуть куски в обход нового приоритета.
@@ -402,8 +533,13 @@ export class StreamManager {
   }
 
   private markCritical(torrent: Torrent, first: number, last: number): void {
+    if (torrent.destroyed) return;
     const span = Math.max(8, Math.ceil(CRITICAL_WINDOW_BYTES / torrent.pieceLength));
-    torrent.critical(first, Math.min(first + span, last));
+    try {
+      torrent.critical(first, Math.min(first + span, last));
+    } catch {
+      /* ignore */
+    }
   }
 
   async prioritizeRange(
@@ -457,6 +593,7 @@ export class StreamManager {
     timeoutMs = 20_000,
   ): Promise<boolean> {
     const { torrent, file } = await this.getFile(topicId, fileIndex);
+    if (torrent.destroyed) return false;
     if (file.length <= 0) return true;
     const clampedEnd = Math.min(end, file.length - 1);
     if (clampedEnd < start) return true;
@@ -481,6 +618,7 @@ export class StreamManager {
     }
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 250));
+      if (torrent.destroyed) break; // раздача уничтожена — ждать нечего
       if (allReceived()) {
         stopTimer();
         return true;
@@ -498,6 +636,7 @@ export class StreamManager {
     end: number,
   ): Promise<boolean> {
     const { torrent, file } = await this.getFile(topicId, fileIndex);
+    if (torrent.destroyed) return false;
     const clampedEnd = Math.min(end, file.length - 1);
     if (clampedEnd < start || start >= file.length) return false;
     const { first, last } = pieceRange(file.offset, start, clampedEnd, torrent.pieceLength);
@@ -521,6 +660,7 @@ export class StreamManager {
     priority: number = Priority.SUBTITLE,
   ): Promise<Buffer | null> {
     const { torrent, file } = await this.getFile(topicId, fileIndex);
+    if (torrent.destroyed) return null;
     if (file.length <= 0) return null;
     const clampedEnd = Math.min(end, file.length - 1);
     if (clampedEnd < start || start >= file.length) return null;
@@ -539,6 +679,10 @@ export class StreamManager {
         if (settled) return;
         settled = true;
         stream.destroy();
+        // Куски так и не доехали: снимаем поднятый приоритет, чтобы он не «перебивал»
+        // обычные PLAYBACK-куски до конца жизни торрента.
+        scheduler?.releaseAt(first, last, [priority]);
+        scheduler?.commit();
         resolve(null);
       }, timeoutMs);
       stream.on('data', (c: Buffer) => chunks.push(c));
@@ -552,6 +696,8 @@ export class StreamManager {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        scheduler?.releaseAt(first, last, [priority]);
+        scheduler?.commit();
         resolve(null);
       });
     });
@@ -603,7 +749,7 @@ export class StreamManager {
 
     try {
       const stopTimer = perf.timer('stream.probe.ms');
-      const json = await runFfprobe(stream);
+      const json = await runFfprobe(stream, PROBE_TIMEOUT_MS);
       stopTimer();
       const media = mapProbe(json, ext);
       this.probeCache.set(key, media);
@@ -652,23 +798,26 @@ export class StreamManager {
   // кеши в памяти. Нужно при активации нового видео: кеш предыдущих раздач больше
   // не нужен (требование «при старте нового видео очистить кеш первого»).
   async destroyOthers(keepTopicId: number): Promise<void> {
-    const victims: Torrent[] = [];
+    const victims: Array<{ id: number; t: Torrent }> = [];
     for (const [id, entry] of this.entries) {
       if (id === keepTopicId) continue;
-      if (entry.torrent && !entry.torrent.destroyed) victims.push(entry.torrent);
-      this.entries.delete(id);
+      if (entry.torrent && !entry.torrent.destroyed) victims.push({ id, t: entry.torrent });
+      else this.entries.delete(id);
       this.playWindows.delete(id);
     }
     for (const key of this.probeCache.keys()) {
       if (!key.startsWith(`${keepTopicId}:`)) this.probeCache.delete(key);
     }
-    if (victims.length === 0) return;
-    await Promise.all(
-      victims.map(
-        (t) => new Promise<void>((res) => t.destroy({ destroyStore: true }, () => res())),
-      ),
-    );
-    log.info(`[cache] pruned torrent stores of ${victims.length} other topic(s) (keep ${keepTopicId})`);
+    // Удаляем записи ТОЛЬКО после фактического destroy: если удалить сразу, гонка
+    // «новый load того же топика» добавит в клиент тот же инфо-хэш до завершения
+    // destroy и получит «Cannot add duplicate torrent».
+    if (victims.length > 0) {
+      await Promise.all(
+        victims.map(({ t }) => this.destroyQuiet(t, { destroyStore: true })),
+      );
+      for (const { id } of victims) this.entries.delete(id);
+      log.info(`[cache] pruned torrent stores of ${victims.length} other topic(s) (keep ${keepTopicId})`);
+    }
   }
 
   async destroy(): Promise<void> {
@@ -685,8 +834,9 @@ export class StreamManager {
   }
 }
 
-function runFfprobe(input: Readable): Promise<unknown> {
+function runFfprobe(input: Readable, timeoutMs: number): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    let settled = false;
     const proc = spawn(
       ffprobePath,
       ['-v', 'error', '-show_format', '-show_streams', '-print_format', 'json', '-i', 'pipe:0'],
@@ -694,10 +844,46 @@ function runFfprobe(input: Readable): Promise<unknown> {
     );
     let stdout = '';
     let stderr = '';
+
+    const settle = (err?: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) {
+        // Снимаем источник/пайп, чтобы не оставить висящий стрим/процесс.
+        try {
+          proc.stdin.destroy();
+        } catch {
+          /* ignore */
+        }
+        try {
+          input.destroy();
+        } catch {
+          /* ignore */
+        }
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+
+    const timer = setTimeout(() => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        /* ignore */
+      }
+      settle(new Error('ffprobe timeout'));
+    }, timeoutMs);
+
     proc.stdout.on('data', (d) => (stdout += d.toString()));
     proc.stderr.on('data', (d) => (stderr += d.toString()));
-    proc.on('error', reject);
+    // ffprobe может выйти раньше конца входного потока — писать в закрытый stdin
+    // нельзя (EPIPE → uncaughtException).
+    proc.stdin.on('error', () => {});
+    proc.on('error', (err) => settle(err));
     proc.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       if (code === 0) {
         try {
           resolve(JSON.parse(stdout));
@@ -708,7 +894,13 @@ function runFfprobe(input: Readable): Promise<unknown> {
         reject(new Error(stderr.trim() || `ffprobe exit ${code}`));
       }
     });
-    input.on('error', () => {});
+    input.on('error', () => {
+      try {
+        input.unpipe(proc.stdin);
+      } catch {
+        /* ignore */
+      }
+    });
     input.pipe(proc.stdin);
   });
 }

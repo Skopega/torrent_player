@@ -27,6 +27,13 @@ export function HistoryCard({
     <div
       className="card history-card"
       onClick={() => onOpen(e.id)}
+      onKeyDown={(ev) => {
+        if (ev.target !== ev.currentTarget) return;
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault();
+          onOpen(e.id);
+        }
+      }}
       role="button"
       tabIndex={0}
     >

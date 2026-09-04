@@ -14,7 +14,12 @@ class Logger {
   }
 
   private write(level: Level, msg: string) {
-    const line = `${new Date().toISOString()} ${level.toUpperCase().padEnd(5)} ${msg}`;
+    // Санитизация управляющих символов: пользовательские строки (запросы, url, msg
+    // клиента) не должны подделывать структуру лога для панели-супервизора.
+    const clean = msg.replace(/[\r\n\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, (c) =>
+      c === '\n' ? '\\n' : c === '\r' ? '\\r' : '\\x' + c.charCodeAt(0).toString(16).padStart(2, '0'),
+    );
+    const line = `${new Date().toISOString()} ${level.toUpperCase().padEnd(5)} ${clean}`;
     process.stdout.write(line + '\n');
     this.stream.write(line + '\n');
   }

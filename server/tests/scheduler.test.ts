@@ -138,3 +138,29 @@ test('releaseAt clears only matching priorities, keeps higher SEEK', () => {
     { op: 'deselect', from: 6, to: 9 },
   ]);
 });
+
+test('externalDeselect re-applies desired ranges on next commit', () => {
+  const t = fakeTorrent(10);
+  const s = schedulerOf(t);
+  s.set(2, 5, 90); // SEEK-хвост
+  s.set(0, 1, 80); // PLAYBACK
+  s.commit();
+  t.calls.length = 0;
+  // Внешний file.deselect() снял всё (как в webtorrent) — планировщик об этом не знал.
+  s.externalDeselect(0, 9);
+  s.commit();
+  assert.deepEqual(t.calls, [
+    { op: 'select', from: 0, to: 1, priority: 80 },
+    { op: 'select', from: 2, to: 5, priority: 90 },
+  ]);
+});
+
+test('commit is a no-op on a destroyed torrent', () => {
+  const t = fakeTorrent(5) as unknown as Torrent & { destroyed: boolean };
+  t.destroyed = true;
+  const s = new TorrentScheduler(t);
+  s.raise(0, 4, 90);
+  s.commit(); // не должно бросить (webtorrent.deselect на destroyed кидает)
+  const calls = (t as unknown as { calls: Call[] }).calls;
+  assert.deepEqual(calls, []);
+});

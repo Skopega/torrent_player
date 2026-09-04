@@ -25,6 +25,9 @@ function isCfChallenge(html: string): boolean {
 // Метаданные (постеры/битрейты/разрешения) при старте чистим только если их кеш
 // вырос выше этого порога; видео-кеши (торренты/HLS/превью) чистим всегда.
 const MAX_METADATA_CACHE_BYTES = 1024 * 1024 * 1024;
+// Свежесть топика в памяти: сиды/постер/размер на rutracker меняются — не держим
+// вечно устаревший кеш, по истечении TTL перечитываем с сайта.
+const TOPIC_TTL_MS = 15 * 60 * 1000;
 
 const PORT = 3000;
 
@@ -77,6 +80,7 @@ export class Services {
   );
 
   private topicCache = this.store.loadTopics();
+  private topicTimes = new Map<number, number>();
   private lastCookieSync = 0;
   private monitorTimer: NodeJS.Timeout;
   // Последний файл, для которого уже сделан per-file prune (дедупликация вызовов
@@ -84,6 +88,8 @@ export class Services {
   private lastPrunedFile: string | null = null;
 
   constructor() {
+    // Темы, поднятые с диска, считаем свежими (кроме того, TTL всё равно обновит).
+    for (const id of this.topicCache.keys()) this.topicTimes.set(id, Date.now());
     // Периодический снимок производительности в лог: метрики этапов + статус
     // закачки/транскода/превью, чтобы анализировать причины фризов постфактум.
     this.monitorTimer = setInterval(() => void this.logPerfSnapshot(), 10_000);
@@ -203,7 +209,13 @@ export class Services {
 
   async getTopic(id: number, persistPoster = true): Promise<Topic> {
     const cached = this.topicCache.get(id);
-    if (cached) return cached;
+    const at = this.topicTimes.get(id) ?? 0;
+    if (cached && Date.now() - at < TOPIC_TTL_MS) return cached;
+    if (cached) {
+      // Устарел — даём перечитать с сайта (сиды/постер могли измениться).
+      this.topicCache.delete(id);
+      this.topicTimes.delete(id);
+    }
 
     await this.auth.ensureLoggedIn();
     await this.syncCookies();
@@ -228,6 +240,7 @@ export class Services {
       if (topic.resolution) this.store.setResolutions({ [String(id)]: topic.resolution });
     }
     this.topicCache.set(id, topic);
+    this.topicTimes.set(id, Date.now());
     this.store.saveTopic(id, topic);
     return topic;
   }
@@ -297,6 +310,7 @@ export class Services {
     this.thumbnails.stopAll();
     await this.stream.clearAll();
     this.topicCache.clear();
+    this.topicTimes.clear();
     this.store.clearCache();
   }
 
@@ -315,10 +329,11 @@ export class Services {
   // только что подняла нас повторно) — видео-кеш не трогаем: он может принадлежать
   // живому серверу, который в этот момент стримит.
   async cleanupAtStartup(): Promise<void> {
-    const metaBytes = this.store.metadataCacheSize();
+    const metaBytes = await this.store.metadataCacheSizeAsync();
     if (metaBytes > MAX_METADATA_CACHE_BYTES) {
       this.store.clearCache();
       this.topicCache.clear();
+    this.topicTimes.clear();
       log.info(
         `[cache] startup: metadata cache ${(metaBytes / 1024 / 1024).toFixed(0)} MB > 1 GB — full clear`,
       );

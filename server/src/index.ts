@@ -22,6 +22,12 @@ function lanAddresses(): string[] {
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+// Пользовательский контент (картинки/торренты) отдаётся с этого origin —
+// запрещаем браузеру угадывать MIME и исполнять его как что-то ещё.
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  next();
+});
 
 const services = new Services();
 app.use('/api', createApi(services));
@@ -66,6 +72,21 @@ async function main() {
     process.exit(1);
   });
 }
+
+// Ошибки (в т.ч. из async-хендлеров, обёрнутых в ah()) всегда отвечаем JSON.
+// Детали 500-х не отдаём наружу — только в лог.
+app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const e = err as { status?: number; message?: string } | undefined;
+  const status = typeof e?.status === 'number' && e.status >= 400 && e.status < 600 ? e.status : 500;
+  if (status >= 500) {
+    log.error(`[http] request failed: ${e?.message ?? String(err)}`);
+    res.status(status).json({ error: 'internal error' });
+    return;
+  }
+  const msg =
+    typeof e?.message === 'string' && e.message ? e.message : status === 413 ? 'body too large' : 'bad request';
+  res.status(status).json({ error: msg });
+});
 
 void main();
 

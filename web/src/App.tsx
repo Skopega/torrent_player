@@ -148,8 +148,8 @@ export default function App() {
     } catch (e) {
       if (id !== requestIdRef.current || controller.signal.aborted) return;
       const msg = e instanceof Error ? e.message : 'search error';
+      // НЕ зануляем results: иначе HomeView покажет «Ничего не найдено» и скроет ошибку.
       setError(msg === 'not_logged_in' ? 'not_logged_in' : msg);
-      setResults([]);
     } finally {
       if (id === requestIdRef.current) setLoading(false);
     }
@@ -390,6 +390,14 @@ function HomeView({
     );
   }
 
+  if (error) {
+    return (
+      <div className="state">
+        <p>Ошибка поиска: {error}</p>
+      </div>
+    );
+  }
+
   if (results) {
     return (
       <>
@@ -413,14 +421,6 @@ function HomeView({
       <div className="state state-loading">
         <div className="spinner" />
         Поиск…
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="state">
-        <p>Ошибка поиска: {error}</p>
       </div>
     );
   }

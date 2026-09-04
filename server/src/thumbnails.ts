@@ -18,6 +18,9 @@ const THUMB_DIR = path.join(DATA_DIR, 'cache', 'thumbnails');
 const STREAM_BASE = 'http://127.0.0.1:3000';
 const PROGRESS_LOG_MS = 15000;
 const RESUME_CHECK_MS = 10000;
+// Жёсткий потолок на один ffmpeg-процесс превью: если он завис (feed не качается,
+// декодер зациклился и т.п.), убиваем — иначе глобальная генерация блокируется вечно.
+const PROCESS_HARD_TIMEOUT_MS = 150_000;
 // Сколько превью генерирует один ffmpeg-запуск (чанк таймлайна). Генерация идёт
 // не одним линейным проходом всего файла, а сиками (-ss) от чанка к чанку: это
 // позволяет (а) не читать файл целиком и (б) быстро переживать паузы — следующий
@@ -91,8 +94,10 @@ export type TranscodeWindowsFn = (
 // при этом продолжается (локальный декод, не конкурирует с транскодом).
 export class ThumbnailManager {
   private jobs = new Map<string, ThumbJob>();
-  private pendingKey: string | null = null;
-  private pausedKey: string | null = null;
+  // Очередь файлов, ждущих свободный генератор (несколько разных файлов за раз).
+  private pending: string[] = [];
+  // Файлы, отложенные правилом параллельности (транскод отстал от playhead).
+  private paused = new Set<string>();
   private resumeTimer: NodeJS.Timeout | null = null;
   // Кеш отсортированных слотов на файл для быстрого «ближайшего» превью (2-сек TTL).
   private slotCache = new Map<string, { at: number; slots: number[] }>();
@@ -119,43 +124,60 @@ export class ThumbnailManager {
   ensure(topicId: number, fileIndex: number): void {
     const key = this.key(topicId, fileIndex);
     if (this.jobs.has(key)) return;
-    if (this.jobs.size > 0) {
-      this.pendingKey = key;
-      return;
-    }
-    this.startIfAllowed(topicId, fileIndex);
-  }
-
-  // Запускает генерацию, если сейчас можно (по правилу параллельности).
-  private startIfAllowed(topicId: number, fileIndex: number): void {
-    const key = this.key(topicId, fileIndex);
-    const reason = this.pauseReason?.(topicId, fileIndex) ?? null;
-    if (reason) {
-      log.info(`[thumbs] ${topicId}:${fileIndex} deferred (${reason})`);
-      this.pausedKey = key;
+    if (this.jobs.size > 0 || this.paused.has(key)) {
+      // Одиночные слоты-«последний пришёл» теряли ранее отложенные файлы — храним
+      // очередь, чтобы каждый дождался своего запуска.
+      if (!this.pending.includes(key)) this.pending.push(key);
       this.scheduleResume();
       return;
     }
-    this.startJob(topicId, fileIndex);
+    this.tryStart(key);
+    if (this.jobs.size === 0 && (this.pending.length || this.paused.size)) this.scheduleResume();
+  }
+
+  // Пытается запустить файл: если правило параллельности запрещает — кладёт в paused.
+  private tryStart(key: string): boolean {
+    const [a, b] = key.split(':').map(Number);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+    const reason = this.pauseReason?.(a, b) ?? null;
+    if (reason) {
+      log.info(`[thumbs] ${key} deferred (${reason})`);
+      this.paused.add(key);
+      return false;
+    }
+    this.startJob(a, b);
+    return true;
   }
 
   private scheduleResume(): void {
-    if (this.resumeTimer) clearTimeout(this.resumeTimer);
+    if (this.resumeTimer) return;
     this.resumeTimer = setTimeout(() => {
       this.resumeTimer = null;
-      if (this.jobs.size > 0) return;
-      if (this.pausedKey) {
-        const [a, b] = this.pausedKey.split(':').map(Number);
-        this.pausedKey = null;
-        if (Number.isFinite(a) && Number.isFinite(b)) this.startIfAllowed(a, b);
-      } else if (this.pendingKey) {
-        const key = this.pendingKey;
-        this.pendingKey = null;
-        const [a, b] = key.split(':').map(Number);
-        if (Number.isFinite(a) && Number.isFinite(b)) this.startIfAllowed(a, b);
-      }
+      this.drain();
     }, RESUME_CHECK_MS);
     this.resumeTimer.unref();
+  }
+
+  // Обрабатывает отложенные файлы, когда освободился единственный генератор:
+  // сначала ждавшие слота (pending), затем приостановленные правилом (paused).
+  private drain(): void {
+    if (this.jobs.size > 0) {
+      this.scheduleResume();
+      return;
+    }
+    while (this.pending.length && this.jobs.size === 0) {
+      const key = this.pending.shift()!;
+      if (this.jobs.has(key) || this.paused.has(key)) continue;
+      if (this.tryStart(key)) break;
+    }
+    if (this.jobs.size === 0 && this.paused.size > 0) {
+      const key = this.paused.values().next().value as string;
+      this.paused.delete(key);
+      this.tryStart(key);
+    }
+    if (this.jobs.size === 0 && (this.pending.length || this.paused.size)) {
+      this.scheduleResume();
+    }
   }
 
   // Синхронный вход в джоб: кладём его в jobs до первых await, чтобы ensure() не
@@ -197,6 +219,8 @@ export class ThumbnailManager {
       if (job.timer) clearInterval(job.timer);
       job.timer = null;
       this.jobs.delete(key);
+      // Дать шанс другим ожидающим (иначе очередь «зависнет» до следующего ensure).
+      this.drain();
       return;
     }
     try {
@@ -289,6 +313,13 @@ export class ThumbnailManager {
             await this.delay(1000);
             continue;
           }
+          // Код 0 не гарантирует запись кадра (например, -ss за конец файла) —
+          // не помечаем «дыру» готовой, а завершаем проход.
+          const targetFile = path.join(job.dir, `thumb${String(slot).padStart(6, '0')}.jpg`);
+          if (!fs.existsSync(targetFile)) {
+            log.info(`[thumbs] ${key} no frame written @${startSec}s (end of stream)`);
+            break;
+          }
           job.slots.add(slot);
           this.noteSlots(topicId, fileIndex, [slot]);
         } else {
@@ -326,16 +357,13 @@ export class ThumbnailManager {
             await this.delay(1000);
             continue;
           }
-          const written: number[] = [];
-          for (let s = startIndex; s < endIndex && s < cap; s++) {
-            if (!job.slots.has(s)) {
-              job.slots.add(s);
-              written.push(s);
-            }
-          }
+          // ffmpeg может выйти с кодом 0, записав меньше кадров, чем просили
+          // (EOF/обрезанный хвост) — помечаем готовыми только реально созданные файлы.
+          const written = this.slotsOnDiskInRange(job.dir, startIndex, endIndex);
+          for (const s of written) job.slots.add(s);
           this.noteSlots(topicId, fileIndex, written);
           const cov = this.coverage(topicId, fileIndex);
-          if (cov <= prevCov) {
+          if (written.length === 0 || cov <= prevCov) {
             log.info(`[thumbs] ${key} reached end of stream (coverage=${cov})`);
             break;
           }
@@ -361,6 +389,23 @@ export class ThumbnailManager {
     } catch {
       /* нет каталога */
     }
+  }
+
+  // Фактически записанные файлы-слоты в [from, to).
+  private slotsOnDiskInRange(dir: string, from: number, to: number): number[] {
+    const out: number[] = [];
+    try {
+      for (const e of fs.readdirSync(dir)) {
+        const m = /^thumb(\d{6})\.jpg$/.exec(e);
+        if (m) {
+          const n = Number(m[1]);
+          if (n >= from && n < to) out.push(n);
+        }
+      }
+    } catch {
+      /* нет каталога */
+    }
+    return out.sort((a, b) => a - b);
   }
 
   // Следующая цель генерации:
@@ -736,15 +781,26 @@ export class ThumbnailManager {
     proc: ChildProcess,
   ): NodeJS.Timeout {
     const key = this.key(topicId, fileIndex);
+    const procStart = Date.now();
     const timer = setInterval(() => {
       const cov = this.coverage(topicId, fileIndex);
       const elapsed = ((Date.now() - job.startedAt) / 1000).toFixed(0);
       log.info(
         `[thumbs] ${key} progress coverage=${cov}/${job.total > 0 ? job.total : '?'} (${cov * THUMB_INTERVAL_SEC}s) elapsed=${elapsed}s`,
       );
+      // Правило параллельности: транскод перестал опережать playhead — пауза.
       const reason = this.pauseReason?.(topicId, fileIndex) ?? null;
       if (reason) {
         log.info(`[thumbs] ${key} pausing (${reason})`);
+        job.cancelled = true;
+        clearInterval(timer);
+        job.timer = null;
+        try { proc.kill(); } catch { /* ignore */ }
+        return;
+      }
+      // Сторож от зависшего ffmpeg (нет причины для паузы, но процесс «висит»).
+      if (Date.now() - procStart > PROCESS_HARD_TIMEOUT_MS) {
+        log.warn(`[thumbs] ${key} ffmpeg stuck >${PROCESS_HARD_TIMEOUT_MS / 1000}s — killing`);
         job.cancelled = true;
         clearInterval(timer);
         job.timer = null;
@@ -766,7 +822,8 @@ export class ThumbnailManager {
     if (wasActive) this.jobs.delete(key);
     if (!wasActive) return; // остановлен извне
     if (job.cancelled) {
-      this.pausedKey = key;
+      // Приостановлен правилом параллельности — вернёмся, когда правило отпустит.
+      this.paused.add(key);
       this.scheduleResume();
       return;
     }
@@ -774,21 +831,11 @@ export class ThumbnailManager {
     log.info(
       `[thumbs] ${key} done coverage=${cov} (${cov * THUMB_INTERVAL_SEC}s) elapsed=${((Date.now() - job.startedAt) / 1000).toFixed(0)}s`,
     );
-    this.startPending();
+    this.drain();
   }
 
   private delay(ms: number): Promise<void> {
     return new Promise((r) => setTimeout(r, ms));
-  }
-
-  private startPending(): void {
-    const key = this.pendingKey;
-    this.pendingKey = null;
-    if (!key) return;
-    const [topicId, fileIndex] = key.split(':').map(Number);
-    if (Number.isFinite(topicId) && Number.isFinite(fileIndex)) {
-      this.startIfAllowed(topicId, fileIndex);
-    }
   }
 
   // Валидирует имя файла превью и возвращает его абсолютный путь (null — иначе).
@@ -898,13 +945,20 @@ export class ThumbnailManager {
       });
       seen.add(key);
     }
-    if (this.pendingKey && !seen.has(this.pendingKey)) {
-      const [topicId, fileIndex] = this.pendingKey.split(':').map(Number);
-      out.push({ topicId, fileIndex, coverage: 0, running: false });
+    for (const key of this.pending) {
+      if (seen.has(key)) continue;
+      const [topicId, fileIndex] = key.split(':').map(Number);
+      if (Number.isFinite(topicId) && Number.isFinite(fileIndex)) {
+        out.push({ topicId, fileIndex, coverage: this.coverage(topicId, fileIndex), running: false });
+        seen.add(key);
+      }
     }
-    if (this.pausedKey && !seen.has(this.pausedKey)) {
-      const [topicId, fileIndex] = this.pausedKey.split(':').map(Number);
-      out.push({ topicId, fileIndex, coverage: this.coverage(topicId, fileIndex), running: false });
+    for (const key of this.paused) {
+      if (seen.has(key)) continue;
+      const [topicId, fileIndex] = key.split(':').map(Number);
+      if (Number.isFinite(topicId) && Number.isFinite(fileIndex)) {
+        out.push({ topicId, fileIndex, coverage: this.coverage(topicId, fileIndex), running: false });
+      }
     }
     return out;
   }
@@ -922,6 +976,18 @@ export class ThumbnailManager {
     }
   }
 
+  // Убирает из очередей (pending/paused) файлы, удовлетворяющие предикату.
+  private pruneQueued(shouldRemove: (topicId: number, fileIndex: number) => boolean): void {
+    this.pending = this.pending.filter((key) => {
+      const [a, b] = key.split(':').map(Number);
+      return !(Number.isFinite(a) && Number.isFinite(b) && shouldRemove(a, b));
+    });
+    for (const key of [...this.paused]) {
+      const [a, b] = key.split(':').map(Number);
+      if (Number.isFinite(a) && Number.isFinite(b) && shouldRemove(a, b)) this.paused.delete(key);
+    }
+  }
+
   stopTopic(topicId: number): void {
     for (const [key, job] of this.jobs) {
       if (key.startsWith(`${topicId}:`)) {
@@ -931,8 +997,7 @@ export class ThumbnailManager {
         this.knownTotals.delete(key);
       }
     }
-    if (this.pendingKey?.startsWith(`${topicId}:`)) this.pendingKey = null;
-    if (this.pausedKey?.startsWith(`${topicId}:`)) this.pausedKey = null;
+    this.pruneQueued((a) => a === topicId);
   }
 
   stopFile(topicId: number, fileIndex: number): void {
@@ -942,8 +1007,7 @@ export class ThumbnailManager {
       this.stopJob(job);
       this.jobs.delete(key);
     }
-    if (this.pendingKey === key) this.pendingKey = null;
-    if (this.pausedKey === key) this.pausedKey = null;
+    this.pruneQueued((a, b) => a === topicId && b === fileIndex);
     this.slotCache.delete(key);
     this.knownTotals.delete(key);
   }
@@ -951,8 +1015,8 @@ export class ThumbnailManager {
   stopAll(): void {
     for (const [, job] of this.jobs) this.stopJob(job);
     this.jobs.clear();
-    this.pendingKey = null;
-    this.pausedKey = null;
+    this.pending = [];
+    this.paused.clear();
     this.slotCache.clear();
     this.knownTotals.clear();
     if (this.resumeTimer) clearTimeout(this.resumeTimer);
@@ -979,14 +1043,7 @@ export class ThumbnailManager {
         /* ignore */
       }
     }
-    if (this.pendingKey) {
-      const [a, b] = this.pendingKey.split(':').map(Number);
-      if (Number.isFinite(a) && Number.isFinite(b) && !keep(a, b)) this.pendingKey = null;
-    }
-    if (this.pausedKey) {
-      const [a, b] = this.pausedKey.split(':').map(Number);
-      if (Number.isFinite(a) && Number.isFinite(b) && !keep(a, b)) this.pausedKey = null;
-    }
+    this.pruneQueued((a, b) => !keep(a, b));
 
     let entries: fs.Dirent[] = [];
     try {

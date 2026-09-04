@@ -51,7 +51,7 @@ export const api = {
   },
 
   async logout(): Promise<void> {
-    await fetch('/api/auth/logout', { method: 'POST' });
+    await json<{ ok: boolean }>(await fetch('/api/auth/logout', { method: 'POST' }));
   },
 
   async search(q: string, signal?: AbortSignal): Promise<SearchResult[]> {
@@ -89,6 +89,7 @@ export const api = {
     topicId: number,
     fileIndex?: number,
     opts?: { audio?: number | null; start?: number; pos?: number; res?: number | null },
+    signal?: AbortSignal,
   ): Promise<StreamStatus> {
     const params = new URLSearchParams();
     if (fileIndex != null) params.set('file', String(fileIndex));
@@ -97,11 +98,13 @@ export const api = {
     if (opts?.pos) params.set('pos', String(opts.pos));
     if (opts?.res != null) params.set('res', String(opts.res));
     const q = params.toString();
-    return json(await fetch(`/api/topic/${topicId}/stream/status${q ? `?${q}` : ''}`));
+    return json(
+      await fetch(`/api/topic/${topicId}/stream/status${q ? `?${q}` : ''}`, { signal }),
+    );
   },
 
   async streamStop(topicId: number): Promise<void> {
-    await fetch(`/api/topic/${topicId}/stream/stop`, { method: 'POST' });
+    await json<{ ok: boolean }>(await fetch(`/api/topic/${topicId}/stream/stop`, { method: 'POST' }));
   },
 
   warmStream(topicId: number): void {
@@ -115,11 +118,13 @@ export const api = {
   },
 
   async streamStart(topicId: number, fileIndex: number): Promise<void> {
-    await fetch(`/api/topic/${topicId}/stream/start`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fileIndex }),
-    });
+    await json<{ ok: boolean }>(
+      await fetch(`/api/topic/${topicId}/stream/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileIndex }),
+      }),
+    );
   },
 
   clientLog(data: unknown): void {

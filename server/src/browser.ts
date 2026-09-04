@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright-core';
@@ -11,8 +11,27 @@ import type { VpnProxy } from './vpn/types.js';
 const PROFILE_DIR = path.join(DATA_DIR, 'chrome-profile');
 const LOGIN_URL = BASE_URL + 'login.php';
 const INDEX_URL = BASE_URL + 'index.php';
+// Верхний предел размера .torrent через браузерный стек.
+const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024;
+const DOWNLOAD_TIMEOUT_MS = 45_000;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+function raceTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(message)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
 
 // Headed/headless: RUTRACKER_HEADED=1 принудительно headed, =0 — headless.
 // По умолчанию (сервер) — headless: Cloudflare проходит и в headless при нативном
@@ -50,9 +69,54 @@ export class BrowserManager {
     const run = this.chain.then(fn, fn);
     this.chain = run.then(
       () => undefined,
-      () => undefined,
+      (err) => {
+        // Chrome мог упасть/потерять CDP-соединение — сбрасываем состояние, чтобы
+        // следующая операция перезапустила браузер через ensure().
+        this.onBrowserFailure(err);
+      },
     );
     return run;
+  }
+
+  // Ошибки соединения с Chrome (Target closed/WS/refused) — не «бизнес»-ошибки.
+  private isConnectionError(err: unknown): boolean {
+    const msg = String((err as { message?: string })?.message ?? err);
+    return /target closed|session closed|browser has been closed|context was destroyed|connection refused|ECONNREFUSED|websocket|cdp/i.test(
+      msg,
+    );
+  }
+
+  private onBrowserFailure(err: unknown): void {
+    if (!this.isConnectionError(err)) return;
+    this.browser = null;
+    this.context = null;
+    // Старый процесс может остаться жить с локом профиля — следующий launch()
+    // приберёт его через killStaleChrome.
+    this.chromeProc = null;
+  }
+
+  // Убивает осиротевший Chrome, держащий наш профиль (крэш/kill -9) — иначе новый
+  // spawn с тем же --user-data-dir не стартует (single-instance) и не отдаёт CDP.
+  private killStaleChrome(): void {
+    const needle = PROFILE_DIR.replace(/\\/g, '/');
+    try {
+      if (process.platform === 'win32') {
+        const ps = spawnSync(
+          'powershell',
+          [
+            '-NoProfile',
+            '-Command',
+            `Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'chrome' -and $_.CommandLine -match [regex]::Escape('${needle}') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+          ],
+          { stdio: 'ignore', timeout: 8000 },
+        );
+        if (ps.error) log.warn(`[browser] stale chrome cleanup failed: ${ps.error.message}`);
+      } else {
+        spawnSync('pkill', ['-f', needle], { stdio: 'ignore', timeout: 5000 });
+      }
+    } catch {
+      /* ignore */
+    }
   }
 
   private ensure(): Promise<void> {
@@ -82,6 +146,9 @@ export class BrowserManager {
 
     const basePort = Number(process.env.RUTRACKER_CDP_PORT) || 9222;
     let lastErr: unknown = new Error('Chrome launch failed');
+
+    // После жёсткого крэша прошлый Chrome мог остаться с локом профиля.
+    this.killStaleChrome();
 
     for (let i = 0; i < 12; i++) {
       const port = basePort + i;
@@ -317,14 +384,21 @@ export class BrowserManager {
         await page.goto(INDEX_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await this.waitChallengeClear(page);
       }
-      const bytes = await page.evaluate(async (u) => {
-        const res = await fetch(u, { credentials: 'include' });
-        const ct = res.headers.get('content-type') ?? '';
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        if (ct.includes('text/html')) throw new Error('challenge-html');
-        const buf = await res.arrayBuffer();
-        return Array.from(new Uint8Array(buf));
-      }, url);
+      // page.evaluate(fetch) нельзя прервать AbortSignal'ом, поэтому гоняем с таймаутом:
+      // зависший rutracker/прокси не должен вечно блокировать всю цепочку браузера.
+      const bytes = await raceTimeout<number[]>(
+        page.evaluate(async (u) => {
+          const res = await fetch(u, { credentials: 'include' });
+          const ct = res.headers.get('content-type') ?? '';
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          if (ct.includes('text/html')) throw new Error('challenge-html');
+          const buf = await res.arrayBuffer();
+          if (buf.byteLength > MAX_DOWNLOAD_BYTES) throw new Error('download too large');
+          return Array.from(new Uint8Array(buf));
+        }, url),
+        DOWNLOAD_TIMEOUT_MS,
+        'download timeout',
+      );
       return Buffer.from(bytes);
     });
   }

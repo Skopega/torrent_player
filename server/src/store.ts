@@ -5,7 +5,6 @@ import type { Topic } from './types.js';
 
 export interface SessionData {
   username: string;
-  password: string;
   cookies: string[];
 }
 
@@ -24,6 +23,9 @@ export interface HistoryEntry {
 }
 
 const HISTORY_MAX = 10;
+// «Битая» картинка — не навсегда: временный 404 (fastpic бот-детект, протухшая
+// сессия, rate-limit) не должен отравлять URL вечно.
+const FAILED_IMAGE_TTL_MS = 6 * 60 * 60 * 1000;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DATA_DIR = process.env.TP_DATA_DIR
@@ -71,6 +73,57 @@ function ensureDir(dir: string) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
+// Асинхронный подсчёт размера каталога: синхронный обход всего видео-кеша (сотни ГБ)
+// на каждый запрос /api/cache/size замораживал бы event loop на секунды.
+async function asyncDirSize(dir: string): Promise<number> {
+  let total = 0;
+  const stack = [dir];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(cur, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const p = path.join(cur, e.name);
+      if (e.isDirectory()) {
+        stack.push(p);
+      } else {
+        try {
+          total += (await fs.promises.stat(p)).size;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+  return total;
+}
+
+async function asyncFileSize(file: string): Promise<number> {
+  try {
+    return (await fs.promises.stat(file)).size;
+  } catch {
+    return 0;
+  }
+}
+
+function sleepMs(ms: number): void {
+  // Не-блочный для CPU сон в синхронном контексте (rmDirRobust): Atomics.wait
+  // приостанавливает поток без busy-loop (100% CPU на Windows-локах).
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    /* Atomics.wait может быть недоступен в некоторых окружениях — падаем на старый цикл */
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      /* noop */
+    }
+  }
+}
+
 // Устойчивое удаление каталога: на Windows файлы могут быть временно залочены
 // (ffmpeg/webtorrent ещё не отпустили дескрипторы), поэтому повторяем с паузами.
 export function rmDirRobust(dir: string): void {
@@ -83,10 +136,7 @@ export function rmDirRobust(dir: string): void {
       lastErr = e;
       if (!fs.existsSync(dir)) return;
     }
-    const until = Date.now() + 300;
-    while (Date.now() < until) {
-      /* короткая синхронная пауза перед повтором */
-    }
+    sleepMs(300);
   }
   if (lastErr) throw lastErr;
 }
@@ -97,6 +147,16 @@ function readJson<T>(file: string, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function readArray(file: string): unknown[] {
+  const v = readJson<unknown>(file, null);
+  return Array.isArray(v) ? v : [];
+}
+
+function readRecord(file: string): Record<string, unknown> {
+  const v = readJson<unknown>(file, null);
+  return v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
 }
 
 function writeJson(file: string, data: unknown) {
@@ -113,16 +173,25 @@ export class Store {
   private bitrates: Record<string, string>;
   private resolutions: Record<string, string>;
   private durations: Record<string, string>;
-  private failedImages: Set<string>;
+  private failedImages: Map<string, number>;
 
   constructor() {
-    this.session = readJson<SessionData | null>(SESSION_FILE, null);
-    this.history = readJson<HistoryEntry[]>(HISTORY_FILE, []);
-    this.posters = readJson<Record<string, string>>(POSTERS_FILE, {});
-    this.bitrates = readJson<Record<string, string>>(BITRATES_FILE, {});
-    this.resolutions = readJson<Record<string, string>>(RESOLUTIONS_FILE, {});
-    this.durations = readJson<Record<string, string>>(DURATIONS_FILE, {});
-    this.failedImages = new Set<string>(readJson<string[]>(FAILED_IMAGES_FILE, []));
+    const sv = readJson<unknown>(SESSION_FILE, null);
+    this.session =
+      sv !== null && typeof sv === 'object' && !Array.isArray(sv) ? (sv as SessionData) : null;
+    this.history = readArray(HISTORY_FILE) as HistoryEntry[];
+    this.posters = readRecord(POSTERS_FILE) as Record<string, string>;
+    this.bitrates = readRecord(BITRATES_FILE) as Record<string, string>;
+    this.resolutions = readRecord(RESOLUTIONS_FILE) as Record<string, string>;
+    this.durations = readRecord(DURATIONS_FILE) as Record<string, string>;
+    // После рестарта точное время ошибки не знаем — ставим «сейчас»: такие ключи
+    // перепроверятся не раньше TTL.
+    const failed = new Map<string, number>();
+    const now = Date.now();
+    for (const k of readArray(FAILED_IMAGES_FILE) as string[]) {
+      if (typeof k === 'string' && k) failed.set(k, now);
+    }
+    this.failedImages = failed;
   }
 
   getSession(): SessionData | null {
@@ -200,12 +269,29 @@ export class Store {
   }
 
   hasFailedImage(key: string): boolean {
-    return this.failedImages.has(key);
+    const ts = this.failedImages.get(key);
+    if (ts == null) return false;
+    if (Date.now() - ts > FAILED_IMAGE_TTL_MS) {
+      // Истёкший «негатив» — даём картинке шанс (и не пишем файл на каждый запрос).
+      this.failedImages.delete(key);
+      return false;
+    }
+    return true;
   }
 
   setFailedImage(key: string): void {
-    this.failedImages.add(key);
-    writeJson(FAILED_IMAGES_FILE, [...this.failedImages]);
+    this.failedImages.set(key, Date.now());
+    writeJson(FAILED_IMAGES_FILE, [...this.failedImages.keys()]);
+  }
+
+  clearFailedImages(): void {
+    if (this.failedImages.size === 0) return;
+    this.failedImages.clear();
+    try {
+      fs.rmSync(FAILED_IMAGES_FILE, { force: true });
+    } catch {
+      /* ignore */
+    }
   }
 
   loadTopics(): Map<number, Topic> {
@@ -238,6 +324,10 @@ export class Store {
     return dirSize(CACHE_DIR);
   }
 
+  async cacheSizeAsync(): Promise<number> {
+    return asyncDirSize(CACHE_DIR);
+  }
+
   // Только метаданные: постеры (img/), json-файлы и кэш тем (topics/).
   // Не включает видео-кеши (торренты, HLS, превью).
   metadataCacheSize(): number {
@@ -248,6 +338,14 @@ export class Store {
       } catch {
         /* нет файла */
       }
+    }
+    return total;
+  }
+
+  async metadataCacheSizeAsync(): Promise<number> {
+    let total = (await asyncDirSize(IMG_DIR)) + (await asyncDirSize(TOPICS_DIR));
+    for (const f of [POSTERS_FILE, BITRATES_FILE, RESOLUTIONS_FILE, DURATIONS_FILE, FAILED_IMAGES_FILE]) {
+      total += await asyncFileSize(f);
     }
     return total;
   }
@@ -265,7 +363,7 @@ export class Store {
     this.bitrates = {};
     this.resolutions = {};
     this.durations = {};
-    this.failedImages = new Set();
+    this.failedImages = new Map();
     rmDirRobust(CACHE_DIR);
     fs.mkdirSync(CACHE_DIR, { recursive: true });
   }

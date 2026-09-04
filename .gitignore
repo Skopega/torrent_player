@@ -9,5 +9,12 @@ runtime/
 # root planning docs
 /*.md
 
-# tray panel
-panel/
+# tray panel: только собранный exe и артефакты компиляции, исходник — под git
+panel/*.exe
+panel/*.obj
+panel/*.pdb
+
+# секреты/ключи (на будущее — если появится шифрование)
+.env
+*.pem
+*.key
