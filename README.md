@@ -9,7 +9,6 @@ general
 
 todo
 - qsv not tested
-- shit ui on a phone screen
 
 
 install
