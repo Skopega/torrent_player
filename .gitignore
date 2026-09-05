@@ -2,9 +2,13 @@ node_modules/
 dist/
 data/
 *.log
+*.tar
 
 # downloaded binaries (portable node, chrome, xray)
 runtime/
+
+# docker build: pre-downloaded linux binaries (ffmpeg/xray/chrome .deb)
+docker/bin/
 
 # root planning docs
 /*.md

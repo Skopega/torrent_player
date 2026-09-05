@@ -1,0 +1,38 @@
+# TrueNAS SCALE (24.10+) Custom App — docker compose YAML
+#
+# Сначала загрузите образ на сервер (по SSH):
+#   docker load < torrent-player.tar
+#
+# Затем в UI TrueNAS: Apps -> Discover Apps -> Custom App (Install via YAML)
+# и вставьте этот файл. Единственное, что нужно поправить — host-путь к data
+# (см. volumes ниже).
+
+services:
+  torrent-player:
+    image: torrent-player:latest
+    container_name: torrent-player
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Часовой пояс (логи).
+      - TZ=Europe/Moscow
+      # Headed Chrome через Xvfb — надёжный обход Cloudflare Turnstile.
+      # (Если капча всё же режется, попробуйте закомментировать и headless.)
+      - RUTRACKER_HEADED=1
+      # Устройство QSV (render-узел iGPU). По умолчанию оставлено пустым —
+      # ffmpeg сам найдёт /dev/dri/renderD128. Если транскод падает на CPU,
+      # раскомментируйте строку ниже.
+      # - TP_QSV_DEVICE=/dev/dri/renderD128
+    volumes:
+      # Папка на сервере TrueNAS, где лежат session.json / vpn.json / cache / chrome-profile.
+      - /mnt/TrueQuash/torrent_player/data:/data
+    devices:
+      # Intel iGPU (UHD 630) для аппаратного транскода QSV.
+      - /dev/dri:/dev/dri
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

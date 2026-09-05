@@ -1,0 +1,24 @@
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# dependencies / build artifacts (rebuild inside the image)
+node_modules
+**/node_modules
+dist
+**/dist
+
+# local runtime state (never bake into the image)
+data
+runtime
+panel
+
+# misc
+*.log
+*.md
+*.tar
+.env
+Dockerfile
+docker-compose.yml
+docker-compose.*.yml
