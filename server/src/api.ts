@@ -26,6 +26,14 @@ function ah(fn: (req: Request, res: Response) => Promise<unknown>): RequestHandl
 export function createApi(services: Services): Router {
   const api = Router();
 
+  // Живость раздачи для серверного watchdog'а: любой запрос браузера к топику
+  // обновляет «последнюю активность». Внутренний ffmpeg-feed (?feed=1) — не в счёт,
+  // иначе транскод поддерживал бы сам себя и сторож никогда не сработал бы.
+  api.use('/topic/:id', (req, _res, next) => {
+    if (req.query.feed !== '1') services.noteClientActivity(Number(req.params.id));
+    next();
+  });
+
   api.post('/client-log', ah(async (req, res) => {
     const b = (req.body ?? {}) as Record<string, unknown>;
     log.warn(

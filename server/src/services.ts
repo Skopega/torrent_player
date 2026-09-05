@@ -29,6 +29,15 @@ const MAX_METADATA_CACHE_BYTES = 1024 * 1024 * 1024;
 // вечно устаревший кеш, по истечении TTL перечитываем с сайта.
 const TOPIC_TTL_MS = 15 * 60 * 1000;
 
+// Watchdog заброшенных раздач: если закрыли вкладку/браузер, сервер не получает
+// стоп-сигнал и продолжал бы транскодить/качать весь фильм до конца. Сторож
+// останавливает топик, от которого давно не было клиентских запросов.
+const WATCHDOG_INTERVAL_MS = 10_000;
+// Нет запросов от браузера дольше этого времени → топик считается брошенным.
+// Не меньше ~60 с: браузер троттлит таймеры скрытой вкладки до ~1/мин, иначе
+// открытая вкладка с паузой/мьютом в фоне получила бы ложный останов.
+const ABANDON_TIMEOUT_MS = 90_000;
+
 const PORT = 3000;
 
 // Занят ли TCP-порт другим процессом (для защиты видео-кеша при двойном старте).
@@ -83,6 +92,9 @@ export class Services {
   private topicTimes = new Map<number, number>();
   private lastCookieSync = 0;
   private monitorTimer: NodeJS.Timeout;
+  private watchdogTimer: NodeJS.Timeout;
+  // Последний момент, когда клиент обращался к раздаче (для watchdog'а).
+  private clientSeen = new Map<number, number>();
   // Последний файл, для которого уже сделан per-file prune (дедупликация вызовов
   // из direct-play маршрута, который ходит по несколько раз на каждый range-запрос).
   private lastPrunedFile: string | null = null;
@@ -94,6 +106,10 @@ export class Services {
     // закачки/транскода/превью, чтобы анализировать причины фризов постфактум.
     this.monitorTimer = setInterval(() => void this.logPerfSnapshot(), 10_000);
     this.monitorTimer.unref();
+    // Закрыли вкладку/браузер — стоп-сигнал не приходит, поэтому периодически
+    // гасим раздачи без свежих клиентских запросов (ffmpeg/превью/закачка).
+    this.watchdogTimer = setInterval(() => void this.sweepAbandoned(), WATCHDOG_INTERVAL_MS);
+    this.watchdogTimer.unref();
     // Заранее определяем аппаратный кодер (NVENC/QSV), чтобы первый HLS-старт
     // не задерживался на пробе.
     void encoderLabel().then((label) => log.info(`[hls] hardware encoder: ${label}`));
@@ -297,7 +313,43 @@ export class Services {
     await this.stream.warm(topicId);
   }
 
+  // Клиент (браузер) обратился к раздаче — отмечаем живость для watchdog'а.
+  noteClientActivity(topicId: number): void {
+    this.clientSeen.set(topicId, Date.now());
+  }
+
+  // Останавливает раздачи, от которых давно не было клиентских запросов: убивает
+  // ffmpeg/превью и паузит торрент (кеш сегментов/кусков сохраняется — быстрый
+  // возврат к тому же видео). Внутренние запросы ffmpeg-feed (?feed=1) живость
+  // не обновляют, иначе транскод «оживлял» бы сам себя.
+  private async sweepAbandoned(): Promise<void> {
+    const now = Date.now();
+    const live = new Set(this.stream.topicIds());
+    // Записи о топиках, которых уже нет в памяти (остановлены/удалены иначе, чем
+    // через stopStream), выбрасываем, чтобы карта не росла бесконечно.
+    for (const id of [...this.clientSeen.keys()]) {
+      if (!live.has(id)) this.clientSeen.delete(id);
+    }
+    for (const id of live) {
+      const lastSeen = this.clientSeen.get(id) ?? 0;
+      if (now - lastSeen < ABANDON_TIMEOUT_MS) continue;
+      // Гасим только «живую» нагрузку: уже остановленные топики не трогаем, чтобы
+      // не логировать повторные стопы каждые 10 с.
+      const busy = this.hls.hasActiveTopic(id) || this.stream.isBusy(id);
+      if (!busy) continue;
+      log.info(
+        `[watchdog] topic ${id} idle ${Math.round((now - lastSeen) / 1000)}s > ${ABANDON_TIMEOUT_MS / 1000}s — stopping (cache kept)`,
+      );
+      try {
+        await this.stopStream(id);
+      } catch (e) {
+        log.warn(`[watchdog] stop topic ${id} failed: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+  }
+
   async stopStream(topicId: number): Promise<void> {
+    this.clientSeen.delete(topicId);
     this.hls.stopTopic(topicId);
     this.subs.stopTopic(topicId);
     this.thumbnails.stopTopic(topicId);
@@ -426,6 +478,7 @@ export class Services {
 
   async close(): Promise<void> {
     clearInterval(this.monitorTimer);
+    clearInterval(this.watchdogTimer);
     await this.hls.stopAll();
     this.subs.stopAll();
     this.thumbnails.stopAll();

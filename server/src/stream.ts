@@ -467,6 +467,14 @@ export class StreamManager {
     return [...this.entries.keys()];
   }
 
+  // Раздача загружена и не на паузе (что-то качает/готово к чтению). Для watchdog'а:
+  // останавливать только живую нагрузку и не трогать уже остановленные топики.
+  isBusy(topicId: number): boolean {
+    const entry = this.entries.get(topicId);
+    const t = entry?.torrent;
+    return !!t && !t.destroyed && !t.paused;
+  }
+
   stop(topicId: number): void {
     const entry = this.entries.get(topicId);
     const t = entry?.torrent;

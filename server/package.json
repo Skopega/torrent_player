@@ -8,7 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test --import tsx tests/rutracker.test.ts tests/stream-utils.test.ts tests/mkv.test.ts tests/scheduler.test.ts tests/cache-dirs.test.ts tests/vless.test.ts tests/subscription.test.ts tests/url-safe.test.ts tests/images.test.ts tests/store.test.ts"
+    "test": "node --test --import tsx tests/rutracker.test.ts tests/stream-utils.test.ts tests/mkv.test.ts tests/scheduler.test.ts tests/cache-dirs.test.ts tests/vless.test.ts tests/subscription.test.ts tests/url-safe.test.ts tests/images.test.ts tests/store.test.ts tests/watchdog.test.ts"
   },
   "dependencies": {
     "cheerio": "^1.0.0",

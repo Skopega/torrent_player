@@ -732,6 +732,24 @@ export class HlsManager {
       if (s.topicId === topicId && s.proc) this.stopSession(s);
       else if (s.topicId === topicId && s.state === 'starting') this.stopSession(s);
     }
+    // Отложенные ре-старты остановленных сессий топика тоже отменяем: иначе после
+    // останова (в т.ч. watchdog'ом) таймер reusePending мог бы перезапустить ffmpeg
+    // без зрителя. Ключ reusePending = sessionKey, начинается с `${topicId}:`.
+    for (const [key, t] of this.reusePending) {
+      if (key.startsWith(`${topicId}:`)) {
+        clearTimeout(t);
+        this.reusePending.delete(key);
+      }
+    }
+  }
+
+  // Есть ли у топика сессии, которые реально готовятся/транскодируют. Нужно
+  // watchdog'у, чтобы останавливать только «живую» нагрузку.
+  hasActiveTopic(topicId: number): boolean {
+    for (const s of this.sessions.values()) {
+      if (s.topicId === topicId && (s.state === 'starting' || s.state === 'active')) return true;
+    }
+    return false;
   }
 
   stopFile(topicId: number, fileIndex: number): void {
