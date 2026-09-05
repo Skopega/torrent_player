@@ -58,11 +58,27 @@ const PROBE_TIMEOUT_MS = 20_000;
 // получали именно нужные куски. Необратимо (webtorrent), поэтому держим небольшим.
 const CRITICAL_WINDOW_BYTES = 8 * 1024 * 1024;
 const TORRENT_DIR = path.join(DATA_DIR, 'cache', 'torrents');
+// Персист DHT-таблицы: одна общая «адресная книга» узлов на все раздачи. Без неё
+// после каждого рестарта DHT стартует с пустой таблицей и набирает узлы через
+// медленный ре-бутстрап (~5-10 минут), из-за чего пиры появляются не сразу.
+const DHT_NODES_FILE = path.join(DATA_DIR, 'dht-nodes.json');
+const DHT_SAVE_INTERVAL_MS = 5 * 60 * 1000;
+
+interface DhtNode {
+  host: string;
+  port: number;
+}
+
+interface DhtLike {
+  addNode?: (node: DhtNode) => void;
+  toJSON?: () => { nodes?: DhtNode[] };
+}
 
 export class StreamManager {
   private client: WebTorrent;
   private entries = new Map<number, Entry>();
   private idleTimer: NodeJS.Timeout;
+  private dhtSaveTimer: NodeJS.Timeout;
   private probeCache = new Map<string, MediaInfo>();
   private playWindows = new Map<number, { playFirst: number; playLast: number; bufLast: number }>();
 
@@ -71,8 +87,52 @@ export class StreamManager {
     this.client.on('error', (err) => {
       log.warn(`[stream] client error: ${err instanceof Error ? err.message : String(err)}`);
     });
+    this.restoreDhtNodes();
+    this.dhtSaveTimer = setInterval(() => this.saveDhtNodes(), DHT_SAVE_INTERVAL_MS);
+    this.dhtSaveTimer.unref();
     this.idleTimer = setInterval(() => this.sweepIdle(), 60_000);
     this.idleTimer.unref();
+  }
+
+  // Общий DHT-инстанс WebTorrent (один на все торренты). Доступ не типизирован в
+  // @types — достаём вручную, признаём по наличию нужных методов.
+  private get dht(): DhtLike | null {
+    const d = (this.client as unknown as { dht?: unknown }).dht;
+    return d && typeof d === 'object' ? (d as DhtLike) : null;
+  }
+
+  private restoreDhtNodes(): void {
+    const dht = this.dht;
+    if (!dht || typeof dht.addNode !== 'function') return;
+    try {
+      const raw = fs.readFileSync(DHT_NODES_FILE, 'utf8');
+      const parsed = JSON.parse(raw) as { nodes?: DhtNode[] };
+      const nodes = Array.isArray(parsed.nodes) ? parsed.nodes : [];
+      let added = 0;
+      for (const n of nodes) {
+        if (n && typeof n.host === 'string' && typeof n.port === 'number' && n.port > 0) {
+          dht.addNode({ host: n.host, port: n.port });
+          added++;
+        }
+      }
+      if (added > 0) log.info(`[stream] restored ${added} dht nodes`);
+    } catch {
+      /* первый запуск или повреждённый файл — начнём с пустой таблицы */
+    }
+  }
+
+  private saveDhtNodes(): void {
+    const dht = this.dht;
+    if (!dht || typeof dht.toJSON !== 'function') return;
+    try {
+      const nodes = dht.toJSON().nodes ?? [];
+      if (nodes.length === 0) return;
+      const tmp = `${DHT_NODES_FILE}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ nodes }), 'utf8');
+      fs.renameSync(tmp, DHT_NODES_FILE);
+    } catch {
+      /* не критично: при следующем тике попробуем снова */
+    }
   }
 
   async load(topicId: number, opts: { quiet?: boolean } = {}): Promise<Torrent> {
@@ -845,6 +905,8 @@ export class StreamManager {
 
   async destroy(): Promise<void> {
     clearInterval(this.idleTimer);
+    clearInterval(this.dhtSaveTimer);
+    this.saveDhtNodes();
     for (const [, entry] of this.entries) {
       if (entry.torrent) {
         await new Promise<void>((res) => entry.torrent?.destroy(() => res()));
