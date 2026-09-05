@@ -212,6 +212,13 @@ export class StreamManager {
           return;
         }
 
+        // Причины 0 пиров живут здесь: трекер отвечает failure/warning (напр. «Invalid
+        // info_hash», Non-200, сетевые сбои) или просто не даёт пиров. Без этих логов
+        // симптом «0 пиров и таймаут метаданных» висит молча.
+        torrent.on('warning', (w) => {
+          const msg = typeof w === 'string' ? w : w instanceof Error ? w.message : String(w);
+          log.warn(`[stream] topic ${topicId} warning: ${msg}`);
+        });
         torrent.on('error', (err) => {
           fail(err);
         });
@@ -266,13 +273,22 @@ export class StreamManager {
       this.source.getMagnet(topicId),
     ]);
     if (torrentRes.status === 'fulfilled') return torrentRes.value;
-    if (magnetRes.status === 'fulfilled' && magnetRes.value) return magnetRes.value;
-    if (torrentRes.status === 'rejected') {
-      log.warn(`[stream] torrent download failed for ${topicId}, magnet unavailable`);
-      const r = torrentRes.reason;
-      throw r instanceof Error ? r : new Error(String(r));
+    const torrentErr = torrentRes.status === 'rejected' ? torrentRes.reason : null;
+    if (magnetRes.status === 'fulfilled' && magnetRes.value) {
+      if (torrentErr) {
+        log.warn(
+          `[stream] topic ${topicId}: .torrent download failed (${errMsg(torrentErr)}), using magnet`,
+        );
+      } else {
+        log.warn(`[stream] topic ${topicId}: .torrent unavailable, using magnet`);
+      }
+      return magnetRes.value;
     }
-    log.warn(`[stream] torrent download failed for ${topicId}, no magnet`);
+    if (torrentErr) {
+      log.warn(`[stream] topic ${topicId}: .torrent download failed and magnet unavailable`);
+      throw torrentErr instanceof Error ? torrentErr : new Error(String(torrentErr));
+    }
+    log.warn(`[stream] topic ${topicId}: .torrent unavailable, no magnet`);
     throw new Error('Не удалось получить .torrent и magnet.');
   }
 
@@ -839,6 +855,10 @@ export class StreamManager {
     await new Promise<void>((res) => this.client.destroy(() => res()));
     log.info('[stream] client destroyed');
   }
+}
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 function runFfprobe(input: Readable, timeoutMs: number): Promise<unknown> {

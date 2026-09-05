@@ -386,20 +386,32 @@ export class BrowserManager {
       }
       // page.evaluate(fetch) нельзя прервать AbortSignal'ом, поэтому гоняем с таймаутом:
       // зависший rutracker/прокси не должен вечно блокировать всю цепочку браузера.
-      const bytes = await raceTimeout<number[]>(
-        page.evaluate(async (u) => {
-          const res = await fetch(u, { credentials: 'include' });
-          const ct = res.headers.get('content-type') ?? '';
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          if (ct.includes('text/html')) throw new Error('challenge-html');
-          const buf = await res.arrayBuffer();
-          if (buf.byteLength > MAX_DOWNLOAD_BYTES) throw new Error('download too large');
-          return Array.from(new Uint8Array(buf));
-        }, url),
-        DOWNLOAD_TIMEOUT_MS,
-        'download timeout',
-      );
-      return Buffer.from(bytes);
+      const started = Date.now();
+      try {
+        const bytes = await raceTimeout<number[]>(
+          page.evaluate(
+            async ({ u, maxBytes }) => {
+              const res = await fetch(u, { credentials: 'include' });
+              const ct = res.headers.get('content-type') ?? '';
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              if (ct.includes('text/html')) throw new Error('challenge-html');
+              const buf = await res.arrayBuffer();
+              if (buf.byteLength > maxBytes) throw new Error('download too large');
+              return Array.from(new Uint8Array(buf));
+            },
+            { u: url, maxBytes: MAX_DOWNLOAD_BYTES },
+          ),
+          DOWNLOAD_TIMEOUT_MS,
+          'download timeout',
+        );
+        log.info(`[browser] download ${url} ok (${bytes.length} B, ${Date.now() - started}ms)`);
+        return Buffer.from(bytes);
+      } catch (e) {
+        log.warn(
+          `[browser] download ${url} failed: ${e instanceof Error ? e.message : String(e)} (${Date.now() - started}ms)`,
+        );
+        throw e;
+      }
     });
   }
 

@@ -90,12 +90,15 @@ function formatTime(seconds: number): string {
 
 function episodeLabel(name: string): string {
   const base = name.replace(/\.[^.]+$/, '');
-  const m = base.match(/\b(?:сери[яиюй]|эпизод|эп|episode|ep|episode)\s*[-_.]?(\d{1,3})\b/i);
+  const m = base.match(/\b(?:сери[яиюй]|эпизод|эп|episode|ep)\s*[-_.]?(\d{1,3})\b/i);
   if (m) return `Серия ${m[1]}`;
   const m2 = base.match(/\b[sS]0?(\d{1,2})[eE]0?(\d{1,3})\b/);
   if (m2) return `Серия ${m2[2]}`;
   const m3 = base.match(/\b(\d{1,2})[xX](\d{1,3})\b/);
   if (m3) return `Серия ${m3[2]}`;
+  // «Title - 01 [web-dl…]»: номер после дефиса/пробела, не часть года/разрешения (1080p).
+  const m4 = base.match(/(?:^|[\s\-_[(])(\d{1,2})(?=\s*(?:[\s\]\._\-]|$))/);
+  if (m4) return `Серия ${m4[1]}`;
   return base;
 }
 
@@ -921,7 +924,7 @@ const toggleFullscreen = () => {
     return (
       <div className="player-state">
         <div className="spinner" />
-        Загрузка файлов раздачи…
+        <span className="player-state-msg">Загрузка файлов раздачи…</span>
       </div>
     );
   }
@@ -988,7 +991,7 @@ const toggleFullscreen = () => {
                 {selected.name}
               </div>
             )}
-            <div className="player-top-menu">
+            <div className={`player-top-menu ${videos.length > 1 ? 'player-top-menu-spread' : ''}`}>
               {videos.length > 1 && (
                 <div className="player-ep-wrap">
                   <button
@@ -1002,10 +1005,13 @@ const toggleFullscreen = () => {
                     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M5 3l14 9-14 9z" strokeLinejoin="round" />
                     </svg>
-                    {selected ? episodeLabel(selected.name) : 'Серии'}
+                    <span className="player-ep-text">
+                      {selected ? episodeLabel(selected.name) : 'Серии'}
+                    </span>
+                    <span className="player-ep-text-mobile">Серия</span>
                   </button>
                   {menuOpen && (
-                    <div className="player-menu">
+                    <div className="player-menu player-menu-episodes">
                       {videos.map((f) => (
                         <button
                           key={f.index}

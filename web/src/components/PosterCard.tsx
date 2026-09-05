@@ -34,11 +34,7 @@ export function PosterCard({
         <div className="title">{r.title}</div>
         {r.tags.length > 0 && (
           <div className="tags">
-            {r.tags.map((t) => (
-              <div className="tag" key={t}>
-                {t}
-              </div>
-            ))}
+            {r.tags.join(' · ')}
           </div>
         )}
         <div className="card-bottom">

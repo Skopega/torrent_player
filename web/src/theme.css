@@ -69,6 +69,12 @@ button {
   backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--border);
   z-index: 100;
+  transition: transform 0.25s ease;
+}
+
+.header.hidden {
+  transform: translateY(-100%);
+  pointer-events: none;
 }
 
 .header-right {
@@ -121,7 +127,7 @@ button {
   border: 1px solid rgba(255, 255, 255, 0.55);
   background: var(--surface);
   color: var(--text);
-  font-size: 15px;
+  font-size: 16px;
   outline: none;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
@@ -148,6 +154,36 @@ button {
 
 .search .search-go:hover {
   color: var(--accent);
+}
+
+/* Круглая кнопка-иконка поиска и крестик закрытия — видимы только на телефонах. */
+.search-toggle,
+.search-close,
+.home-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.search-toggle:hover,
+.search-close:hover,
+.home-btn:hover {
+  background: var(--surface-hover);
+}
+
+.search-close {
+  position: absolute;
+  left: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 3;
 }
 
 /* ---------- login ---------- */
@@ -192,7 +228,7 @@ button {
 }
 
 .cache-btn {
-  display: flex;
+  display: none;
   align-items: center;
   gap: 8px;
   height: 42px;
@@ -259,6 +295,10 @@ button {
   color: var(--text);
   font-size: 14px;
   outline: none;
+}
+
+.dropdown textarea {
+  font-size: 13px;
 }
 
 .dropdown input:focus {
@@ -778,6 +818,7 @@ button {
   gap: 16px;
   padding: 12px;
   min-width: 0;
+  min-height: 240px;
   background: linear-gradient(90deg, #262629, var(--surface) 40%);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -825,6 +866,11 @@ button {
 .history-card:hover .history-remove,
 .history-remove:focus-visible {
   opacity: 1;
+}
+
+/* Чтобы первая строка заголовка не наезжала на крестик удаления. */
+.history-card .title {
+  padding-right: 28px;
 }
 
 .history-remove:hover {
@@ -879,10 +925,12 @@ button {
 }
 
 .card .tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 10px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+  overflow: hidden;
   font-size: 13px;
+  line-height: 1.5;
   color: var(--text-dim);
 }
 
@@ -973,8 +1021,12 @@ button {
 
 .detail-hero-bg {
   position: absolute;
-  inset: -60px;
+  inset: 0;
   z-index: 0;
+  border-radius: var(--radius);
+  overflow: hidden;
+  /* Safari не обрезает потомка с filter по border-radius родителя — клипаем сам слой. */
+  clip-path: inset(0 round var(--radius));
 }
 
 .detail-hero-bg img {
@@ -1049,6 +1101,8 @@ button {
 .detail-category {
   display: inline-flex;
   align-items: center;
+  text-align: center;
+  line-height: 1.4;
   padding: 5px 14px;
   border-radius: 999px;
   background: var(--accent-soft);
@@ -1066,7 +1120,9 @@ button {
 
 .chip {
   display: inline-flex;
-  align-items: baseline;
+  align-items: center;
+  text-align: center;
+  line-height: 1.4;
   gap: 6px;
   padding: 5px 14px;
   border-radius: 999px;
@@ -1399,6 +1455,10 @@ button {
   background: rgba(255, 255, 255, 0.22);
 }
 
+.player-ep-text-mobile {
+  display: none;
+}
+
 .player-menu {
   position: absolute;
   top: calc(100% + 8px);
@@ -1723,5 +1783,336 @@ button {
   }
   .grid {
     grid-template-columns: 1fr;
+  }
+
+  /* ---------- мобильная шапка ---------- */
+  .header {
+    gap: 8px;
+  }
+  .brand {
+    display: none;
+  }
+  .cache-btn {
+    display: none;
+  }
+  .search-toggle {
+    display: flex;
+  }
+  .home-btn {
+    display: flex;
+  }
+  .search-wrap {
+    display: none;
+  }
+  .header.search-open {
+    gap: 0;
+  }
+  .header.search-open .brand,
+  .header.search-open .header-right,
+  .header.search-open .search-toggle,
+  .header.search-open .home-btn {
+    display: none;
+  }
+  .header.search-open .search-wrap {
+    display: flex;
+    justify-content: stretch;
+    padding: 0 20px;
+  }
+  .header.search-open .search {
+    width: 100%;
+    max-width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .header.search-open .search-close {
+    display: flex;
+    position: static;
+    transform: none;
+    margin-right: 12px;
+  }
+  .header.search-open .search input {
+    flex: 1;
+    padding: 0 42px 0 20px;
+  }
+
+  /* ---------- плитки: пилюли не съезжают ---------- */
+  .card .meta .badge-dur {
+    margin-left: 0;
+  }
+
+  /* ---------- мобильный плеер ---------- */
+  .player {
+    overflow: visible;
+  }
+  .player-stage {
+    background: transparent;
+  }
+  .player-video {
+    border-radius: var(--radius);
+  }
+  /* Скругления видны и когда показан интерфейс: скругляем верх/низ оверлея. */
+  .player-overlay {
+    border-radius: var(--radius);
+  }
+  .player-top {
+    flex-wrap: wrap;
+    gap: 8px;
+    border-top-left-radius: var(--radius);
+    border-top-right-radius: var(--radius);
+  }
+  .player-bottom {
+    border-bottom-left-radius: var(--radius);
+    border-bottom-right-radius: var(--radius);
+  }
+  .player-buffering {
+    border-radius: var(--radius);
+  }
+  .player-title {
+    flex-basis: 100%;
+    width: 100%;
+    font-size: 13px;
+  }
+  .player-top-menu {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  /* С кнопкой «Серия» — меню растянуто на ширину названия. */
+  .player-top-menu-spread {
+    width: 100%;
+    margin-left: 0;
+    justify-content: space-between;
+  }
+  .player-ep-btn {
+    height: 30px;
+    padding: 0 10px;
+    font-size: 12px;
+  }
+  .player-ep-text {
+    display: none;
+  }
+  .player-ep-text-mobile {
+    display: inline;
+  }
+  .player-big-play {
+    inset: auto;
+    margin: 0;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 56px;
+    height: 56px;
+    border-radius: 0;
+    background: transparent;
+    transition: none;
+  }
+  .player-big-play:hover {
+    transform: translate(-50%, -50%);
+    background: transparent;
+  }
+  .player-big-play svg {
+    width: 32px;
+    height: 32px;
+  }
+  .player-bottom {
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 8px 10px 10px;
+  }
+  .player-seek {
+    flex-basis: 100%;
+    order: 10;
+    margin: 0 4px;
+  }
+  .player-ctl {
+    width: 32px;
+    height: 32px;
+  }
+  .player-time {
+    font-size: 11px;
+  }
+  .player-volume {
+    margin-left: auto;
+  }
+  .player-volume-slider {
+    display: none;
+  }
+  /* Меню серий/озвучки/субтитров — привязаны к верхней панели, не вылезают за экран. */
+  .player-ep-wrap {
+    position: static;
+  }
+  .player-top {
+    position: relative;
+  }
+  .player-menu,
+  .player-settings {
+    max-height: min(60vh, 340px);
+  }
+  .player-menu {
+    max-width: 100%;
+    min-width: 160px;
+  }
+  /* Меню серий — под левой кнопкой, а не справа. */
+  .player-menu-episodes {
+    left: 0;
+    right: auto;
+  }
+  /* На телефоне только спинер, без текста и без затемнения фона. */
+  .player-buffering {
+    background: transparent;
+  }
+  .player-buffering-text,
+  .player-state-msg {
+    display: none;
+  }
+  /* Спиннер плеера в полтора раза меньше и на уровне big play. */
+  .player-buffering .spinner,
+  .player-state .spinner {
+    width: 20px;
+    height: 20px;
+    border-width: 2px;
+    margin-bottom: 0;
+  }
+
+  /* ---------- мобильные детали ---------- */
+  .detail-body {
+    padding: 0 16px;
+  }
+  .detail-hero-content {
+    grid-template-columns: 1fr;
+    align-items: center;
+    justify-items: center;
+    text-align: center;
+    gap: 14px;
+    padding: 16px;
+  }
+  .detail-poster .poster-box {
+    max-width: 220px;
+    margin: 0 auto;
+  }
+  .detail-main {
+    align-items: center;
+    text-align: center;
+  }
+  .detail-main h1 {
+    font-size: 24px;
+    margin: 0 0 8px;
+    text-align: center;
+  }
+  .detail-meta {
+    font-size: 13px;
+    line-height: 1.45;
+    margin: 0 0 10px;
+    text-align: center;
+  }
+  .detail-category {
+    font-size: 13px;
+    padding: 7px 16px;
+    margin: 0 auto;
+  }
+  .chips {
+    gap: 8px;
+    margin: 10px 0 16px;
+    justify-content: center;
+  }
+  .actions {
+    justify-content: center;
+    align-items: center;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 2px;
+    margin-bottom: 8px;
+  }
+  .btn-play {
+    height: 46px;
+    padding: 0 22px;
+    font-size: 14px;
+  }
+  .fields {
+    grid-template-columns: minmax(96px, 118px) 1fr;
+    gap: 8px 12px;
+    font-size: 13px;
+  }
+  .fields .k {
+    font-size: 12px;
+  }
+  .fields .v {
+    font-size: 13px;
+  }
+
+  /* ---------- мобильная выдача: шрифт меньше, tags в 2 раза мельче ---------- */
+  .card .title {
+    font-size: 15px;
+    -webkit-line-clamp: 4;
+  }
+  .card .tags {
+    font-size: 9px;
+    line-height: 1.4;
+    gap: 3px 6px;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    overflow: hidden;
+  }
+  .card .meta {
+    font-size: 12px;
+  }
+  .badge {
+    font-size: 11px;
+    padding: 3px 8px;
+  }
+
+  /* ---------- мобильный дропдаун: не вылезает за экран ---------- */
+  .dropdown {
+    position: fixed;
+    left: 8px;
+    right: 8px;
+    top: calc(var(--header-h) + 6px);
+    width: auto;
+    max-height: calc(100vh - var(--header-h) - 24px);
+    overflow-y: auto;
+    z-index: 300;
+  }
+
+  /* ---------- мобильные фильтры/сортировка ---------- */
+  .filter-bar {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 18px 16px;
+    gap: 22px;
+  }
+  .filter-divider {
+    display: none;
+  }
+  .filter-group,
+  .filter-mid,
+  .sort-control {
+    width: 100%;
+  }
+  .filter-group {
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    text-align: center;
+  }
+  .filter-mid {
+    flex-direction: column;
+    gap: 22px;
+  }
+  .filter-block {
+    width: 100%;
+  }
+  .dual-wrap {
+    width: 100%;
+    max-width: 100%;
+  }
+  .sort-control {
+    justify-content: center;
+  }
+  /* Пилюля сортировки одной высоты с пилюлей качества. */
+  .preset-btn,
+  .sort-btn {
+    height: 34px;
+    padding: 0 16px;
   }
 }

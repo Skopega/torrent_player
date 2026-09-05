@@ -58,9 +58,12 @@ export default function App() {
   const [sortKey, setSortKey] = useState<SortKey>('seeds');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [headerHidden, setHeaderHidden] = useState(false);
   const scheduledRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     api
@@ -119,6 +122,45 @@ export default function App() {
     api.authStatus().then(setAuth).catch(() => {});
   }, []);
 
+  // На телефонах прячем шапку при прокрутке вниз (чтобы не следовала за экраном).
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 800px)');
+    let lastY = window.scrollY;
+    let ticking = false;
+    const onScroll = () => {
+      if (ticking) return;
+      ticking = true;
+      window.requestAnimationFrame(() => {
+        ticking = false;
+        if (!mq.matches) {
+          setHeaderHidden(false);
+          return;
+        }
+        const y = window.scrollY;
+        const delta = y - lastY;
+        if (Math.abs(delta) > 4) {
+          if (delta > 0 && y > 120) setHeaderHidden(true);
+          else setHeaderHidden(false);
+          lastY = y;
+        }
+      });
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+
+  useEffect(() => {
+    if (searchOpen) setHeaderHidden(false);
+  }, [searchOpen]);
+
+  useEffect(() => {
+    if (searchOpen) searchInputRef.current?.focus();
+  }, [searchOpen]);
+
+  useEffect(() => {
+    if (view.name === 'detail') setSearchOpen(false);
+  }, [view.name]);
+
   const runSearch = useCallback(async (raw: string) => {
     abortRef.current?.abort();
     const controller = new AbortController();
@@ -163,6 +205,7 @@ export default function App() {
     setResults(null);
     setError(null);
     setLoading(false);
+    setSearchOpen(false);
     window.location.hash = '/';
   }, []);
 
@@ -288,21 +331,52 @@ export default function App() {
 
   return (
     <>
-      <header className="header">
+      <header className={`header ${searchOpen ? 'search-open' : ''} ${headerHidden && !searchOpen ? 'hidden' : ''}`}>
         <div className="brand" onClick={goHome}>
-          <span className="dot" />
           Torrent Player
         </div>
+        <button
+          className="home-btn"
+          aria-label="Домой"
+          title="Домой"
+          onClick={goHome}
+        >
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M3 10.5 12 3l9 7.5" />
+            <path d="M5 9.5V20a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V9.5" />
+          </svg>
+        </button>
+        <button
+          className="search-toggle"
+          aria-label="Поиск"
+          title="Поиск"
+          onClick={() => setSearchOpen(true)}
+        >
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="11" cy="11" r="7" />
+            <path d="M21 21l-4.3-4.3" />
+          </svg>
+        </button>
         <div className="search-wrap">
           <div className="search">
+            <button
+              className="search-close"
+              aria-label="Закрыть поиск"
+              title="Закрыть поиск"
+              onClick={() => setSearchOpen(false)}
+            >
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M18 6 6 18M6 6l12 12" strokeLinecap="round" />
+              </svg>
+            </button>
             <input
+              ref={searchInputRef}
               value={query}
               onChange={(e) => onChangeQuery(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') runSearch(query);
               }}
               placeholder="Поиск"
-              autoFocus
             />
             <button
               className="search-go"
