@@ -8,6 +8,20 @@ import net from 'node:net';
 const VERDICT_TTL_MS = 30_000;
 const verdictCache = new Map<string, { ok: boolean; at: number }>();
 
+// Доверенные хосты приложения (сайт rutracker и его CDN вложений), зашитые в код,
+// а не приходящие извне. Для них DNS-проверка пропускается: rutracker.org может
+// не резолвиться локальным DNS (блокировка провайдером), хотя реально доступен
+// через VPN-прокси, и блокировка давала бы ложный «non-public host».
+const TRUSTED_BASE_HOSTS = new Set(['rutracker.org', 'rutracker.cc']);
+
+function isTrustedHost(host: string): boolean {
+  const h = host.toLowerCase();
+  for (const base of TRUSTED_BASE_HOSTS) {
+    if (h === base || h.endsWith('.' + base)) return true;
+  }
+  return false;
+}
+
 export class UnsafeUrlError extends Error {
   constructor(public readonly reason: string) {
     super(`unsafe url: ${reason}`);
@@ -82,14 +96,16 @@ export async function assertSafeHttpUrl(raw: string): Promise<URL> {
   }
   const host = u.hostname;
   if (!host) throw new UnsafeUrlError('no host');
-  const literalVersion = net.isIP(host);
-  let blocked: boolean;
-  if (literalVersion !== 0) {
-    blocked = isPrivateAddress(host);
-  } else {
-    blocked = await resolveHostPrivate(host);
+  if (!isTrustedHost(host)) {
+    const literalVersion = net.isIP(host);
+    let blocked: boolean;
+    if (literalVersion !== 0) {
+      blocked = isPrivateAddress(host);
+    } else {
+      blocked = await resolveHostPrivate(host);
+    }
+    if (blocked) throw new UnsafeUrlError(`non-public host: ${host}`);
   }
-  if (blocked) throw new UnsafeUrlError(`non-public host: ${host}`);
   u.hash = '';
   return u;
 }

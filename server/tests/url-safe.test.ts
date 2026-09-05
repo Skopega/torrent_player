@@ -37,3 +37,20 @@ test('assertSafeHttpUrl: allows public literal IP', async () => {
   const u = await assertSafeHttpUrl('http://93.158.134.3/x');
   assert.equal(u.hostname, '93.158.134.3');
 });
+
+test('assertSafeHttpUrl: allows trusted rutracker hosts without DNS', async () => {
+  for (const url of [
+    'https://rutracker.org/forum/viewtopic.php?t=1',
+    'https://rutracker.cc/forum/',
+    'https://static.rutracker.org/img/logo.png',
+    'https://static.rutracker.cc/img/x.png',
+  ]) {
+    const u = await assertSafeHttpUrl(url);
+    assert.ok(u.hostname, url);
+  }
+});
+
+test('isTrustedHost: case-insensitive', async () => {
+  const u = await assertSafeHttpUrl('https://RUTRACKER.ORG/forum/');
+  assert.equal(u.hostname, 'rutracker.org');
+});
