@@ -673,6 +673,67 @@ export function createApi(services: Services): Router {
     res.json({ history: services.store.removeHistory(id) });
   });
 
+  api.get('/history/:id/resume', (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      res.status(400).json({ error: 'bad id' });
+      return;
+    }
+    res.json(services.store.getHistoryResume(id));
+  });
+
+  api.post('/history/:id/resume', (req, res) => {
+    const id = Number(req.params.id);
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const fileIndex = b.fileIndex == null ? null : Number(b.fileIndex);
+    const position = b.position == null ? null : Number(b.position);
+    if (
+      !Number.isFinite(id) ||
+      (fileIndex !== null && !Number.isFinite(fileIndex)) ||
+      (position !== null && !Number.isFinite(position))
+    ) {
+      res.status(400).json({ error: 'bad resume' });
+      return;
+    }
+    if (fileIndex !== null && position !== null) {
+      services.store.setHistoryResume(id, fileIndex, position);
+    }
+    res.json({ ok: true });
+  });
+
+  api.post('/history/:id/volume', (req, res) => {
+    const id = Number(req.params.id);
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const volume = b.volume == null ? null : Number(b.volume);
+    const muted = b.muted === true;
+    if (
+      !Number.isFinite(id) ||
+      volume == null ||
+      !Number.isFinite(volume) ||
+      volume < 0 ||
+      volume > 1
+    ) {
+      res.status(400).json({ error: 'bad volume' });
+      return;
+    }
+    services.store.setHistoryVolume(id, volume, muted);
+    res.json({ ok: true });
+  });
+
+  api.post('/history/:id/tracks', (req, res) => {
+    const id = Number(req.params.id);
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const audioTrack = b.audioTrack == null ? null : Number(b.audioTrack);
+    const subtitleTrack = b.subtitleTrack == null ? null : Number(b.subtitleTrack);
+    const valid = (v: number | null) => v == null || (Number.isFinite(v) && v >= 0);
+    if (!Number.isFinite(id) || !valid(audioTrack) || !valid(subtitleTrack)) {
+      res.status(400).json({ error: 'bad tracks' });
+      return;
+    }
+    services.store.setHistoryTracks(id, audioTrack, subtitleTrack);
+    res.json({ ok: true });
+  });
+
   api.get('/cache/size', async (_req, res) => {
     res.json({ bytes: await services.store.cacheSizeAsync() });
   });

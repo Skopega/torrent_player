@@ -21,6 +21,18 @@ export interface HistoryEntry {
   bitrate: string | null;
   duration: string | null;
   date: string;
+  // Настройки просмотра, живут в записи истории — удаление записи автоматически
+  // «забывает» их:
+  // - «Продолжить с последней серии»: индекс последнего запущенного видеофайла и
+  //   реальная позиция в нём (сек);
+  // - громкость (0..1) и состояние mute, выбранные на слайдере;
+  // - выбранные дорожки: индекс аудио-потока (озвучка) и субтитров (null = off).
+  lastFileIndex?: number;
+  lastPosition?: number;
+  volume?: number;
+  muted?: boolean;
+  audioTrack?: number | null;
+  subtitleTrack?: number | null;
 }
 
 const HISTORY_MAX = 10;
@@ -256,7 +268,20 @@ export class Store {
   }
 
   addHistory(entry: HistoryEntry): HistoryEntry[] {
-    this.history = [entry, ...this.history.filter((e) => e.id !== entry.id)].slice(0, HISTORY_MAX);
+    // Re-add существующей раздачи (повторное «Смотреть») не должен стирать
+    // настройки просмотра: чего нет в новой записи — переносим из старой.
+    const prev = this.history.find((e) => e.id === entry.id);
+    let merged = entry;
+    if (prev) {
+      merged = { ...entry };
+      if (merged.lastFileIndex == null) merged.lastFileIndex = prev.lastFileIndex;
+      if (merged.lastPosition == null) merged.lastPosition = prev.lastPosition;
+      if (merged.volume == null) merged.volume = prev.volume;
+      if (merged.muted == null) merged.muted = prev.muted;
+      if (merged.audioTrack == null) merged.audioTrack = prev.audioTrack;
+      if (merged.subtitleTrack == null) merged.subtitleTrack = prev.subtitleTrack;
+    }
+    this.history = [merged, ...this.history.filter((e) => e.id !== entry.id)].slice(0, HISTORY_MAX);
     writeJson(HISTORY_FILE, this.history);
     return this.history;
   }
@@ -265,6 +290,66 @@ export class Store {
     this.history = this.history.filter((e) => e.id !== id);
     writeJson(HISTORY_FILE, this.history);
     return this.history;
+  }
+
+  getHistoryResume(id: number): {
+    fileIndex: number | null;
+    position: number | null;
+    volume: number | null;
+    muted: boolean | null;
+    audioTrack: number | null;
+    subtitleTrack: number | null;
+  } {
+    const e = this.history.find((x) => x.id === id);
+    if (!e) {
+      return {
+        fileIndex: null,
+        position: null,
+        volume: null,
+        muted: null,
+        audioTrack: null,
+        subtitleTrack: null,
+      };
+    }
+    return {
+      fileIndex: e.lastFileIndex ?? null,
+      position: e.lastPosition ?? null,
+      volume: e.volume ?? null,
+      muted: e.muted ?? null,
+      audioTrack: e.audioTrack ?? null,
+      subtitleTrack: e.subtitleTrack ?? null,
+    };
+  }
+
+  // Обновляет прогресс только у существующей записи (без переупорядочивания
+  // истории). Записи нет — no-op, чтобы «мёртвое» обновление после удаления из
+  // истории не воскрешало прогресс.
+  setHistoryResume(id: number, fileIndex: number, position: number): boolean {
+    const e = this.history.find((x) => x.id === id);
+    if (!e) return false;
+    e.lastFileIndex = fileIndex;
+    e.lastPosition = position;
+    writeJson(HISTORY_FILE, this.history);
+    return true;
+  }
+
+  setHistoryVolume(id: number, volume: number, muted: boolean): boolean {
+    const e = this.history.find((x) => x.id === id);
+    if (!e) return false;
+    e.volume = volume;
+    e.muted = muted;
+    writeJson(HISTORY_FILE, this.history);
+    return true;
+  }
+
+  // Выбранные дорожки: аудио-поток (озвучка) и поток субтитров (null = off).
+  setHistoryTracks(id: number, audioTrack: number | null, subtitleTrack: number | null): boolean {
+    const e = this.history.find((x) => x.id === id);
+    if (!e) return false;
+    e.audioTrack = audioTrack;
+    e.subtitleTrack = subtitleTrack;
+    writeJson(HISTORY_FILE, this.history);
+    return true;
   }
 
   getPoster(id: number): string | null {

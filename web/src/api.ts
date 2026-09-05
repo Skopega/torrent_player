@@ -2,6 +2,7 @@ import type {
   AuthStatus,
   EnrichEntry,
   HistoryEntry,
+  HistoryResume,
   LoginResult,
   MediaInfo,
   SearchResult,
@@ -169,6 +170,44 @@ export const api = {
       await fetch(`/api/history/${id}`, { method: 'DELETE' }),
     );
     return body.history;
+  },
+
+  async historyResume(topicId: number): Promise<HistoryResume> {
+    return json(await fetch(`/api/history/${topicId}/resume`));
+  },
+
+  async historySetResume(topicId: number, fileIndex: number, position: number): Promise<void> {
+    await json<{ ok: boolean }>(
+      await fetch(`/api/history/${topicId}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileIndex, position }),
+      }),
+    );
+  },
+
+  async historySetVolume(topicId: number, volume: number, muted: boolean): Promise<void> {
+    await json<{ ok: boolean }>(
+      await fetch(`/api/history/${topicId}/volume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ volume, muted }),
+      }),
+    );
+  },
+
+  async historySetTracks(
+    topicId: number,
+    audioTrack: number | null,
+    subtitleTrack: number | null,
+  ): Promise<void> {
+    await json<{ ok: boolean }>(
+      await fetch(`/api/history/${topicId}/tracks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ audioTrack, subtitleTrack }),
+      }),
+    );
   },
 
   async cacheClear(): Promise<number> {

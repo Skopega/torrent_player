@@ -38,6 +38,24 @@ export interface HistoryEntry {
   duration: string | null;
   enrichTried?: boolean;
   date: string;
+  // Последняя запущенная серия и позиция в ней (заполняются сервером).
+  lastFileIndex?: number;
+  lastPosition?: number;
+  // Громкость (0..1) и mute, выбранные на слайдере (заполняются сервером).
+  volume?: number;
+  muted?: boolean;
+  // Выбранные дорожки: аудио-поток и поток субтитров (null = off).
+  audioTrack?: number | null;
+  subtitleTrack?: number | null;
+}
+
+export interface HistoryResume {
+  fileIndex: number | null;
+  position: number | null;
+  volume: number | null;
+  muted: boolean | null;
+  audioTrack: number | null;
+  subtitleTrack: number | null;
 }
 
 export interface TopicField {

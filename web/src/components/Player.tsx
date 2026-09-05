@@ -19,6 +19,12 @@ const SUB_POLL_MS = 2000;
 const HLS_SEGMENT_SECONDS = 2;
 const roundStart = (t: number) => Math.max(0, Math.floor(t / HLS_SEGMENT_SECONDS) * HLS_SEGMENT_SECONDS);
 
+// Сохранение прогресса «продолжить с последней серии»: позиция пишется, только
+// когда реально просмотрено не с 0:00, и не чаще интервала/дельты.
+const RESUME_MIN_SEC = 3;
+const RESUME_SAVE_INTERVAL_MS = 5000;
+const RESUME_SAVE_DELTA_SEC = 5;
+
 // Доступные потолки разрешения транскода (по убыванию).
 const RES_OPTIONS = [2160, 1440, 1080, 720, 480, 360];
 
@@ -166,6 +172,20 @@ export function Player({ topicId }: { topicId: number }) {
   // Какому fileIndex соответствует текущий media (гейт HLS-эффекта против гонки
   // «новый fileIndex + старый media» при переключении эпизодов).
   const mediaFileRef = useRef<number | null>(null);
+  // Одноразовая цель восстановления из истории: {fileIndex, позиция} для старта
+  // плеера с последней серии. Потребляется probe-эффектом при успешном старте файла.
+  const pendingResumeRef = useRef<{ fileIndex: number; position: number } | null>(null);
+  // Одноразовые настройки звука из истории: применяются к <video>, как только он
+  // появляется в DOM.
+  const pendingPrefsRef = useRef<{ volume: number; muted: boolean } | null>(null);
+  // Выбранные в истории дорожки (озвучка/субтитры): применяются к каждому файлу
+  // (серии) при probe; обновляются при выборе в меню и сохраняются на сервер.
+  const avPrefsRef = useRef<{ audioTrack: number | null; subtitleTrack: number | null }>({
+    audioTrack: null,
+    subtitleTrack: null,
+  });
+  // Последний сохранённый прогресс (для дедупликации записей на интервале).
+  const lastSavedResumeRef = useRef<{ fileIndex: number; position: number } | null>(null);
 
   const [files, setFiles] = useState<StreamFile[] | null>(null);
   const [fileIndex, setFileIndex] = useState<number | null>(null);
@@ -216,6 +236,33 @@ export function Player({ topicId }: { topicId: number }) {
     : null;
   const directPlay = media ? media.canDirectPlay && selectedAbs === defaultAbs : false;
 
+  // Сохраняет прогресс просмотра на сервере (в записи истории). force — финальное
+  // сохранение при размонтировании: игнорируем дельту, но не порог «просмотрено
+  // не с 0:00».
+  const saveResume = (fileIndex: number, position: number, force = false) => {
+    if (position < RESUME_MIN_SEC) return;
+    const last = lastSavedResumeRef.current;
+    const pos = Math.floor(position);
+    if (!force && last && last.fileIndex === fileIndex && pos - last.position < RESUME_SAVE_DELTA_SEC) {
+      return;
+    }
+    lastSavedResumeRef.current = { fileIndex, position: pos };
+    api.historySetResume(topicId, fileIndex, pos).catch(() => {});
+  };
+
+  // Сохраняет громкость/mute (выбранные на слайдере) на сервере, в записи истории.
+  const persistVolume = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    api.historySetVolume(topicId, video.volume, video.muted).catch(() => {});
+  };
+
+  // Сохраняет выбранные дорожки (озвучка/субтитры) на сервере, в записи истории.
+  const persistTracks = () => {
+    const p = avPrefsRef.current;
+    api.historySetTracks(topicId, p.audioTrack, p.subtitleTrack).catch(() => {});
+  };
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -224,11 +271,40 @@ export function Player({ topicId }: { topicId: number }) {
     setFileIndex(null);
     setMedia(null);
     setStatus(null);
-    api
-      .streamFiles(topicId)
-      .then((f) => {
+    // Параллельно со списком файлов спрашиваем, с какой серии продолжить (раздача
+    // в истории): сервер — источник истины, поэтому работает и по прямой ссылке.
+    Promise.all([
+      api.streamFiles(topicId),
+      api.historyResume(topicId).catch(() => ({
+        fileIndex: null,
+        position: null,
+        volume: null,
+        muted: null,
+        audioTrack: null,
+        subtitleTrack: null,
+      })),
+    ])
+      .then(([f, resume]) => {
         if (cancelled) return;
         setFiles(f);
+        pendingResumeRef.current = null;
+        pendingPrefsRef.current = null;
+        if (resume.volume != null) {
+          pendingPrefsRef.current = { volume: resume.volume, muted: resume.muted === true };
+        }
+        avPrefsRef.current = {
+          audioTrack: resume.audioTrack ?? null,
+          subtitleTrack: resume.subtitleTrack ?? null,
+        };
+        const target =
+          resume.fileIndex != null ? f.find((x) => x.index === resume.fileIndex && x.isVideo) : null;
+        if (target) {
+          setFileIndex(target.index);
+          if (resume.position != null && resume.position > 0) {
+            pendingResumeRef.current = { fileIndex: target.index, position: resume.position };
+          }
+          return;
+        }
         const def = f.find((x) => x.isVideo) ?? f[0] ?? null;
         setFileIndex(def ? def.index : null);
       })
@@ -263,9 +339,47 @@ export function Player({ topicId }: { topicId: number }) {
       .streamProbe(topicId, fileIndex)
       .then((m) => {
         if (cancelled) return;
+        // Выбранные дорожки из истории применяем к каждой серии: ищем сохранённые
+        // потоки в текущем файле, не нашли — дефолт (default audio, субтитры off).
         const aIdx = m.audioTracks.findIndex((t) => t.default);
-        setAudioSel(aIdx >= 0 ? aIdx : 0);
-        setSubSel(0);
+        let audioIdx = aIdx >= 0 ? aIdx : 0;
+        if (avPrefsRef.current.audioTrack != null) {
+          const found = m.audioTracks.findIndex((t) => t.index === avPrefsRef.current.audioTrack);
+          if (found >= 0) audioIdx = found;
+        }
+        setAudioSel(audioIdx);
+        let subIdx = 0;
+        if (avPrefsRef.current.subtitleTrack != null) {
+          const found = m.subtitleTracks.findIndex(
+            (t) => t.index === avPrefsRef.current.subtitleTrack && t.isText,
+          );
+          if (found >= 0) subIdx = found + 1;
+        }
+        setSubSel(subIdx);
+        // Старт последней серии с сохранённой позиции: direct-play восстановит
+        // currentTime по loadedmetadata; HLS стартует от границы сегмента (sessionStart).
+        const pending = pendingResumeRef.current;
+        pendingResumeRef.current = null;
+        const direct =
+          m.canDirectPlay &&
+          (m.audioTracks[audioIdx]?.index ?? null) ===
+            (m.audioTracks.find((t) => t.default)?.index ?? m.audioTracks[0]?.index ?? null);
+        if (pending && pending.fileIndex === fileIndex && pending.position > 0) {
+          if (direct) {
+            setSessionStart(0);
+            setSubWindowStart(0);
+            resumeRealRef.current = pending.position;
+          } else {
+            const start = roundStart(pending.position);
+            setSessionStart(start);
+            setSubWindowStart(Math.max(0, start - SUB_LEAD));
+            resumeRealRef.current = null;
+          }
+        } else {
+          setSessionStart(0);
+          setSubWindowStart(0);
+          resumeRealRef.current = null;
+        }
         // По умолчанию — максимальное качество (выше исходника сервер и так не масштабирует).
         setResSel(maxResFor(m.height));
         mediaFileRef.current = fileIndex;
@@ -619,14 +733,48 @@ export function Player({ topicId }: { topicId: number }) {
     };
   }, [topicId, fileIndex]);
 
+  // Периодическое сохранение прогресса просмотра (для «продолжить с последней
+  // серии»). Пишем только когда файл реально проигрывается не с 0:00.
+  useEffect(() => {
+    if (fileIndex == null || media == null) return;
+    const tick = () => {
+      if (mediaFileRef.current !== fileIndex) return;
+      const o = statusOptsRef.current;
+      saveResume(fileIndex, o.pos);
+    };
+    tick();
+    const iv = window.setInterval(tick, RESUME_SAVE_INTERVAL_MS);
+    return () => window.clearInterval(iv);
+  }, [fileIndex, media]);
+
   useEffect(() => {
     return () => {
       if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
       if (clickTimerRef.current) window.clearTimeout(clickTimerRef.current);
       if (hlsRef.current) hlsRef.current.destroy();
+      // Финальная фиксация прогресса активной серии и громкости при закрытии плеера.
+      const fi = mediaFileRef.current;
+      if (fi != null) {
+        const o = statusOptsRef.current;
+        saveResume(fi, o.pos, true);
+      }
+      persistVolume();
       api.streamStop(topicId).catch(() => {});
     };
   }, [topicId]);
+
+  // Применяет сохранённые в истории настройки звука, как только <video> доступен.
+  useEffect(() => {
+    const video = videoRef.current;
+    const p = pendingPrefsRef.current;
+    if (!video || !p) return;
+    pendingPrefsRef.current = null;
+    const v = Math.min(1, Math.max(0, p.volume));
+    video.muted = p.muted;
+    video.volume = v;
+    setMuted(p.muted);
+    setVolume(v);
+  });
 
   useEffect(() => {
     const sync = () => setFullscreen(Boolean(document.fullscreenElement));
@@ -701,6 +849,7 @@ export function Player({ topicId }: { topicId: number }) {
     const video = videoRef.current;
     if (!video) return;
     video.muted = !video.muted;
+    persistVolume();
   };
 
   const setVolumeFromSlider = (v: number) => {
@@ -730,6 +879,7 @@ export function Player({ topicId }: { topicId: number }) {
     if (!volumeDragRef.current) return;
     volumeDragRef.current = false;
     (e.currentTarget as HTMLDivElement).releasePointerCapture?.(e.pointerId);
+    persistVolume();
   };
 
   const isControlTarget = (target: EventTarget | null): boolean => {
@@ -784,6 +934,9 @@ const toggleFullscreen = () => {
   const selectAudio = (i: number) => {
     const video = videoRef.current;
     const t = media?.audioTracks[i];
+    // Запоминаем выбранную озвучку (поток), субтитры не трогаем.
+    avPrefsRef.current = { ...avPrefsRef.current, audioTrack: t?.index ?? null };
+    persistTracks();
     if (!media || !video) {
       setAudioSel(i);
       return;
@@ -810,6 +963,15 @@ const toggleFullscreen = () => {
       seekStartRef.current = performance.now();
       setSeeking(true);
     }
+  };
+
+  // Выбор субтитров: 0 = off; i > 0 — позиция дорожки в списке (trackList[i-1]).
+  const selectSubtitle = (i: number) => {
+    const tracks = media?.subtitleTracks ?? [];
+    const stream = i > 0 ? (tracks[i - 1]?.index ?? null) : null;
+    avPrefsRef.current = { ...avPrefsRef.current, subtitleTrack: stream };
+    setSubSel(i);
+    persistTracks();
   };
 
   // Смена потолка разрешения транскода: перезапускаем HLS-сессию с текущей позиции.
@@ -1086,7 +1248,7 @@ const toggleFullscreen = () => {
                     <button
                       className={`player-menu-item ${subSel === 0 ? 'active' : ''}`}
                       onClick={() => {
-                        setSubSel(0);
+                        selectSubtitle(0);
                         setSubMenuOpen(false);
                       }}
                     >
@@ -1100,7 +1262,7 @@ const toggleFullscreen = () => {
                         key={t.index}
                         className={`player-menu-item ${subSel === i + 1 ? 'active' : ''}`}
                         onClick={() => {
-                          setSubSel(i + 1);
+                          selectSubtitle(i + 1);
                           setSubMenuOpen(false);
                         }}
                         disabled={!t.isText}
