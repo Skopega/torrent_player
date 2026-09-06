@@ -15,7 +15,7 @@ docker
 - run build-docker.bat
 - put .tar on a server
 - load docker
-- run it via docker-compose.yml (set TP_DATA_DIR to your data folder) or: docker run -d -p 3000:3000 -v /path/to/data:/data torrent-player:latest
+- run it via docker-compose.yml (set TP_DATA_DIR to your data folder)
 
 cool features
 - builtin vless config/subscription support
