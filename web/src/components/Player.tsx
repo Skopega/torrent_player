@@ -764,6 +764,8 @@ export function Player({
     };
   });
 
+  // Статус закачки и прогресс транскода (зелёная зона / +MM:SS) опрашиваем одним
+  // запросом каждые 2 с: иначе зона транскода обновляется рывками (была 20 с).
   useEffect(() => {
     if (fileIndex == null) return;
     const ac = new AbortController();
@@ -781,7 +783,7 @@ export function Player({
         .catch(() => {});
     };
     tick();
-    const iv = window.setInterval(tick, 20000);
+    const iv = window.setInterval(tick, 2000);
     return () => {
       alive = false;
       ac.abort();
