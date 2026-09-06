@@ -1,6 +1,6 @@
 general
 - open a web ui 
-- search for watchable media using your rutracker account
+- search for watchable media using your rutracker account OR use magnet/.torrent
 - filter by resolution, bitrate, seeds
 - watch in realtime while downloading and transcoding
 - nvenc/qsv/x264 hls
