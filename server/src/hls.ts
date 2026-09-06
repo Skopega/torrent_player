@@ -13,13 +13,19 @@ import type { SubtitleManager } from './subs.js';
 import type { MediaInfo } from './types.js';
 
 const HLS_DIR = path.join(DATA_DIR, 'cache', 'hls');
-const STREAM_BASE = 'http://127.0.0.1:3000';
+const STREAM_BASE = `http://127.0.0.1:${Number(process.env.TP_PORT) || 3000}`;
 
 // Сегменты 2 с (закрытый GOP в транскоде) — точная перемотка и быстрый seek.
 const SEGMENT_SECONDS = 2;
 // Лимит суммарного дискового кеша HLS (сегменты не удаляются при seek, поэтому
 // нужен потолок — иначе remux до EOF быстро забьёт диск).
 const HLS_MAX_BYTES = 20 * 1024 * 1024 * 1024;
+// Докачка точки входа перед спавном ffmpeg после перемотки: ждём, пока куски
+// позиции seek реально скачаются (с потолком), чтобы транскод не вис на feed.
+const SEEK_READY_TIMEOUT_MS = 25_000;
+// Ширина критического окна при seek: помечаем больший диапазон как critical,
+// чтобы нужные куски доехали первыми (rarest-first их иначе откладывает).
+const SEEK_CRITICAL_BYTES = 32 * 1024 * 1024;
 
 // Асинхронный подсчёт размера каталога: синхронный обход всего HLS-кеша на каждый
 // start() блокировал event loop (фризы при перемотке на больших кешах).
@@ -110,6 +116,9 @@ export class HlsManager {
   private reusePending = new Map<string, NodeJS.Timeout>();
   // Прогресс транскода на сессию (для детекции «завис» ffmpeg) и prefetch-окно.
   private progress = new Map<string, ProgressTrack>();
+  // Последний снимок transcodedEndSec на сессию — для мгновенной (а не накопленной)
+  // скорости в snapshot().
+  private speedPrev = new Map<string, { sec: number; at: number }>();
   private keepAheadTimer: NodeJS.Timeout;
 
   constructor(
@@ -314,7 +323,8 @@ export class HlsManager {
     if (startSec > 0) {
       const dur = media.durationSec ?? 0;
       // Точный байт по MKV Cues (для VBR оценка frac*size неточна): приоритизируем
-      // реальный кластер и коротко ждём его, чтобы ffmpeg не блокировался.
+      // реальный кластер и ждём докачки его кусков (с потолком), чтобы ffmpeg не
+      // блокировался на feed — иначе транскод «стопорится, потом рывок».
       const exactByte =
         file.length > 0 ? await this.subs.seekByteFor(topicId, fileIndex, startSec).catch(() => null) : null;
       if (exactByte != null) {
@@ -323,8 +333,15 @@ export class HlsManager {
         const bs = Math.max(0, exactByte - marginBack);
         const be = Math.min(file.length - 1, exactByte + windowForward);
         try {
-          await this.stream.prioritizeRange(topicId, fileIndex, bs, be);
-          await this.stream.waitForBytes(topicId, fileIndex, bs, Math.min(be, bs + 8 * 1024 * 1024), 8000);
+          await this.stream.prioritizeRange(topicId, fileIndex, bs, be, Priority.SEEK, SEEK_CRITICAL_BYTES);
+          await this.stream.waitForBytes(
+            topicId,
+            fileIndex,
+            bs,
+            Math.min(be, bs + 8 * 1024 * 1024),
+            SEEK_READY_TIMEOUT_MS,
+            SEEK_CRITICAL_BYTES,
+          );
         } catch {
           /* ignore */
         }
@@ -334,7 +351,15 @@ export class HlsManager {
         const byteStart = Math.floor(frac * file.length);
         const byteEnd = Math.min(file.length - 1, byteStart + 8 * 1024 * 1024);
         try {
-          await this.stream.prioritizeRange(topicId, fileIndex, byteStart, byteEnd);
+          await this.stream.prioritizeRange(topicId, fileIndex, byteStart, byteEnd, Priority.SEEK, SEEK_CRITICAL_BYTES);
+          await this.stream.waitForBytes(
+            topicId,
+            fileIndex,
+            byteStart,
+            byteEnd,
+            SEEK_READY_TIMEOUT_MS,
+            SEEK_CRITICAL_BYTES,
+          );
         } catch {
           /* ignore */
         }
@@ -667,16 +692,31 @@ export class HlsManager {
     }> = [];
     for (const s of this.sessions.values()) {
       if (s.state === 'stopped') continue;
-      const elapsed = Math.max(1, (now - s.startedAt) / 1000);
-      const done = Math.max(0, s.transcodedEndSec - s.startSec);
+      // Мгновенная скорость: дельта transcodedEndSec за интервал между снимками.
+      // Накопленная done/elapsed «скакала», когда transcodedEndSec обновлялся кусками.
+      const prev = this.speedPrev.get(s.sessionId);
+      let speedMul: number;
+      if (prev) {
+        const dSec = s.transcodedEndSec - prev.sec;
+        const dMs = Math.max(1, now - prev.at);
+        speedMul = Math.round((dSec / (dMs / 1000)) * 100) / 100;
+      } else {
+        const elapsed = Math.max(1, (now - s.startedAt) / 1000);
+        const done = Math.max(0, s.transcodedEndSec - s.startSec);
+        speedMul = Math.round((done / elapsed) * 100) / 100;
+      }
+      this.speedPrev.set(s.sessionId, { sec: s.transcodedEndSec, at: now });
       out.push({
         topicId: s.topicId,
         fileIndex: s.fileIndex,
         state: s.state,
         startSec: s.startSec,
         endSec: s.transcodedEndSec,
-        speedMul: Math.round((done / elapsed) * 100) / 100,
+        speedMul,
       });
+    }
+    for (const id of this.speedPrev.keys()) {
+      if (!this.byId.has(id)) this.speedPrev.delete(id);
     }
     return out;
   }
@@ -932,6 +972,8 @@ export class HlsManager {
   }
 
   // Сколько секунд уже перекодировано в конкретной сессии (относительно её старта).
+  // Считаем по готовым сегментам на диске, а не по плейлисту: ffmpeg пишет плейлист
+  // пачками/через .tmp, поэтому прогресс по плейлисту «скачет», а по seg-файлам — гладкий.
   async transcodedSeconds(
     topicId: number,
     fileIndex: number,
@@ -941,9 +983,23 @@ export class HlsManager {
   ): Promise<number | null> {
     const s = this.sessions.get(this.key(topicId, fileIndex, audio, roundStartSec(startSec), res));
     if (!s) return null;
-    const { count, relSec } = await this.scanPlaylist(s.dir);
+    const count = await this.segmentCount(s.dir);
+    const relSec = count * SEGMENT_SECONDS;
     s.transcodedEndSec = s.startSec + relSec;
     return count > 0 ? relSec : null;
+  }
+
+  private async segmentCount(dir: string): Promise<number> {
+    let count = 0;
+    try {
+      const entries = await fs.promises.readdir(dir);
+      for (const e of entries) {
+        if (/^seg\d{5}\.m4s$/.test(e)) count++;
+      }
+    } catch {
+      /* ignore */
+    }
+    return count;
   }
 
   segmentPath(s: HlsSession, name: string): string | null {
@@ -971,6 +1027,7 @@ export class HlsManager {
     this.reusePending.clear();
     this.readers.clear();
     this.progress.clear();
+    this.speedPrev.clear();
     await Promise.all(procs.map((p) => HlsManager.waitExit(p, 2000)));
   }
 }

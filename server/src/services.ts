@@ -1,5 +1,7 @@
 import { HttpClient, BASE_URL, encodeCp1251 } from './http.js';
 import net from 'node:net';
+import fs from 'node:fs';
+import path from 'node:path';
 import { Store } from './store.js';
 import { Auth } from './auth.js';
 import { Images } from './images.js';
@@ -13,7 +15,9 @@ import { parseSearch, parseTopic } from './rutracker.js';
 import { VpnManager } from './vpn/manager.js';
 import { log } from './logger.js';
 import { perf } from './perf.js';
-import type { SearchResult, Topic } from './types.js';
+import { LocalLibrary, type LocalMeta } from './local.js';
+import { formatBytes, type SearchResult, type Topic } from './types.js';
+import type { HistoryEntry } from './store.js';
 
 function isCfChallenge(html: string): boolean {
   const head = html.slice(0, 30000);
@@ -60,6 +64,7 @@ export class Services {
   readonly browser = new BrowserManager(this.vpn);
   readonly http = new HttpClient(this.vpn);
   readonly store = new Store();
+  readonly local = new LocalLibrary();
   readonly auth = new Auth(this.store, this.browser);
   readonly images = new Images(this.http, this.store);
   readonly stream = new StreamManager({
@@ -102,6 +107,10 @@ export class Services {
   constructor() {
     // Темы, поднятые с диска, считаем свежими (кроме того, TTL всё равно обновит).
     for (const id of this.topicCache.keys()) this.topicTimes.set(id, Date.now());
+    // Реестр локальных источников приводим в соответствие с историей: источник
+    // живёт, только пока есть запись истории (чистим «осиротевшие» после краша
+    // между регистрацией и первым просмотром), остальные регистрируем в стриме.
+    this.syncLocalSourcesAtStartup();
     // Периодический снимок производительности в лог: метрики этапов + статус
     // закачки/транскода/превью, чтобы анализировать причины фризов постфактум.
     this.monitorTimer = setInterval(() => void this.logPerfSnapshot(), 10_000);
@@ -113,6 +122,232 @@ export class Services {
     // Заранее определяем аппаратный кодер (NVENC/QSV), чтобы первый HLS-старт
     // не задерживался на пробе.
     void encoderLabel().then((label) => log.info(`[hls] hardware encoder: ${label}`));
+  }
+
+  // --- Локальные magnet/.torrent раздачи --------------------------------------
+
+  // Приводит реестр локальных источников в соответствие с записями истории и
+  // регистрирует выжившие источники в StreamManager (для отрицательных topicId
+  // они используются до обращения к rutracker).
+  private syncLocalSourcesAtStartup(): void {
+    const historyLocalIds = this.store
+      .getHistory()
+      .filter((e) => e.kind === 'local')
+      .map((e) => e.id);
+    const removed = this.local.sweep(historyLocalIds);
+    if (removed.length > 0) {
+      log.info(`[local] swept ${removed.length} orphan local source(s)`);
+    }
+    for (const meta of this.local.list()) this.registerLocalSource(meta);
+  }
+
+  private registerLocalSource(meta: LocalMeta): void {
+    if (meta.kind === 'magnet') {
+      this.stream.setLocalSource(meta.id, { magnet: meta.magnet });
+    } else {
+      const p = this.local.sourceTorrentPath(meta.id);
+      if (p) this.stream.setLocalSource(meta.id, { torrentFile: p });
+    }
+  }
+
+  // Добавление записи истории через обёртку: локальные источники, вытесненные
+  // за общий кап, удаляются с диска (запись пропала — источник больше не нужен).
+  historyAdd(entry: HistoryEntry): HistoryEntry[] {
+    const before = new Set(this.store.getHistory().map((e) => e.id));
+    const after = this.store.addHistory(entry);
+    const now = new Set(after.map((e) => e.id));
+    for (const id of before) {
+      if (!now.has(id) && this.local.getByTopicId(id)) {
+        void this.purgeLocal(id).catch((e) => {
+          log.warn(`[local] purge evicted ${id} failed: ${e instanceof Error ? e.message : e}`);
+        });
+      }
+    }
+    return after;
+  }
+
+  // Ручное удаление записи из истории (крестик): для локальных раздач чистим
+  // источник целиком (стоп потока + видео-кеш + data/local).
+  async removeHistoryEntry(id: number): Promise<HistoryEntry[]> {
+    if (this.local.getByTopicId(id)) {
+      await this.purgeLocal(id);
+    }
+    return this.store.removeHistory(id);
+  }
+
+  // Полная очистка локальной раздачи: стоп, удаление видео-кеша (HLS/превью/куски),
+  // снятие локального источника и удаление персистентного хранилища.
+  async purgeLocal(id: number): Promise<void> {
+    try {
+      await this.stopStream(id);
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.hls.removeCacheExcept(id, null);
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.thumbnails.removeCacheExcept(id, null);
+    } catch {
+      /* ignore */
+    }
+    await this.stream.destroyTopic(id);
+    this.local.remove(id);
+    log.info(`[local] purged topic ${id} (source removed)`);
+  }
+
+  // Возвращает локальную мету или null (для не-локальных id).
+  localMeta(id: number): LocalMeta | null {
+    return this.local.getByTopicId(id);
+  }
+
+  // Баннер локальной раздачи: файл есть — true, иначе false.
+  hasLocalBanner(id: number): boolean {
+    return this.localMeta(id)?.hasBanner === true;
+  }
+
+  // Регистрирует magnet-ссылку как локальную раздачу. absId выбирается так, чтобы
+  // не совпасть с уже существующими записями истории (защита от «наследования»
+  // настроек/резюме чужой раздачи при потере/сбросе реестра data/local).
+  async addLocalMagnet(magnet: string): Promise<LocalMeta> {
+    const meta = await this.local.addMagnet(magnet, undefined, this.nextLocalAbsId());
+    this.registerLocalSource(meta);
+    return meta;
+  }
+
+  // Регистрирует .torrent (байты) как локальную раздачу.
+  async addLocalTorrent(buf: Buffer): Promise<LocalMeta> {
+    const meta = await this.local.addTorrent(buf, undefined, this.nextLocalAbsId());
+    this.registerLocalSource(meta);
+    return meta;
+  }
+
+  // Минимальный свободный absId: больше всех занятых в реестре И в записях истории
+  // (local-записи могут остаться после потери data/local/index.json).
+  private nextLocalAbsId(): number {
+    let max = 0;
+    for (const m of this.local.list()) max = Math.max(max, m.absId);
+    for (const e of this.store.getHistory()) {
+      if (e.kind === 'local' && e.id < 0) max = Math.max(max, -e.id);
+    }
+    return max + 1;
+  }
+
+  // Переименование локальной раздачи: обновляет реестр и title в истории.
+  renameLocal(id: number, name: string): LocalMeta | null {
+    const meta = this.local.rename(id, name);
+    if (meta) this.store.updateHistory(id, { title: meta.name });
+    return meta;
+  }
+
+  // «Страницу закрыли»: если запись истории так и не создана (не начали смотреть) —
+  // источник удаляем. Возвращает true, если источник был удалён.
+  async closeLocal(id: number): Promise<boolean> {
+    const inHistory = this.store.getHistory().some((e) => e.id === id);
+    if (inHistory) return false;
+    if (!this.local.getByTopicId(id)) return false;
+    await this.purgeLocal(id);
+    return true;
+  }
+
+  // Старт просмотра локальной раздачи: создаёт/обновляет запись истории и в фоне
+  // запускает генерацию баннера (если его ещё нет).
+  async watchLocal(
+    id: number,
+    opts: { name?: string; fileIndex?: number | null },
+  ): Promise<HistoryEntry[]> {
+    const meta = this.local.getByTopicId(id);
+    if (!meta) throw new Error('Локальная раздача не найдена.');
+
+    let sizeHuman = '';
+    let resolution: string | null = null;
+    let durationSec: number | null = null;
+    try {
+      const files = await this.stream.files(id);
+      let total = 0;
+      for (const f of files) {
+        if (f.isVideo) total += f.length;
+      }
+      sizeHuman = formatBytes(total);
+    } catch {
+      /* торрент ещё не готов — размер оставим пустым */
+    }
+    // Авто-имя: введённое пользователем → сохранённое → настоящее имя раздачи
+    // (для magnet приходит после получения метаданных).
+    const torrentName = this.stream.torrentName(id);
+    const typed = typeof opts.name === 'string' && opts.name.trim() ? opts.name.trim() : null;
+    const name = typed ?? (meta.name || torrentName || '');
+    if (name !== meta.name) {
+      this.local.rename(id, name);
+      meta.name = name;
+    }
+    if (opts.fileIndex != null && Number.isFinite(opts.fileIndex)) {
+      try {
+        const m = await this.stream.probe(id, opts.fileIndex);
+        durationSec = m.durationSec;
+        const w = m.width ?? 0;
+        const h = m.height ?? 0;
+        if (w > 0 && h > 0) {
+          if (w >= 3200 || h >= 2000) resolution = '4K';
+          else if (w >= 2500 || h >= 1400) resolution = '1440p';
+          else if (w >= 1900 || h >= 1000) resolution = '1080p';
+          else if (w >= 1152 || h >= 700) resolution = '720p';
+          else if (w >= 700 || h >= 470) resolution = '480p';
+          else resolution = 'SD';
+        }
+      } catch {
+        /* probe может не успеть — разрешение/длительность пропустим */
+      }
+    }
+
+    const entry: HistoryEntry = {
+      id,
+      title: name || `Раздача ${Math.abs(id)}`,
+      category: 'Локальный торрент',
+      poster: meta.hasBanner ? `/api/local/${id}/banner` : null,
+      sizeHuman,
+      seeds: 0,
+      leech: 0,
+      resolution,
+      bitrate: null,
+      duration:
+        durationSec != null && durationSec > 0
+          ? `${Math.floor(durationSec / 60)}:${String(Math.floor(durationSec % 60)).padStart(2, '0')}`
+          : null,
+      date: new Date().toISOString().slice(0, 10),
+      kind: 'local',
+    };
+    const history = this.historyAdd(entry);
+
+    if (opts.fileIndex != null && Number.isFinite(opts.fileIndex)) {
+      const fi = opts.fileIndex as number;
+      if (!this.local.getByTopicId(id)?.hasBanner) {
+        void this.generateLocalBanner(id, fi).catch((e) => {
+          log.warn(`[local] banner for ${id} failed: ${e instanceof Error ? e.message : e}`);
+        });
+      }
+    }
+    return history;
+  }
+
+  // Генерирует баннер локальной раздачи из случайного кадра средней полосы
+  // таймлайна (первые/последние 10% отбрасываются). Лучший-effort: если кадров
+  // ещё нет — оставляем без баннера (следующий watch попробует снова).
+  private async generateLocalBanner(id: number, fileIndex: number): Promise<void> {
+    const frame = await this.thumbnails.bannerFrame(id, fileIndex);
+    if (!frame) return;
+    const dest = this.local.bannerPath(id);
+    try {
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(frame, dest);
+      this.local.setBanner(id, true);
+      this.store.updateHistory(id, { poster: `/api/local/${id}/banner` });
+      log.info(`[local] banner set for topic ${id} (file ${fileIndex})`);
+    } catch (e) {
+      log.warn(`[local] banner copy for ${id} failed: ${e instanceof Error ? e.message : e}`);
+    }
   }
 
   private async logPerfSnapshot(): Promise<void> {
@@ -406,6 +641,8 @@ export class Services {
   ): Promise<Record<string, { poster?: string; bitrate?: string; resolution?: string; duration?: string }>> {
     const out: Record<string, { poster?: string; bitrate?: string; resolution?: string; duration?: string }> =
       {};
+    // Локальные (отрицательные id) не обогащаются: источник — не rutracker.
+    ids = ids.filter((id) => id > 0);
     const todo = ids.filter(
       (id) =>
         !this.store.getPoster(id) ||

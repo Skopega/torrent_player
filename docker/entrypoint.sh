@@ -27,6 +27,14 @@ log() { echo "[supervisor] $(date '+%H:%M:%S') $*"; }
 
 is_alive() { [ -n "$CHILD" ] && kill -0 "$CHILD" 2>/dev/null; }
 
+# Убиваем не только node, а всю его process group (ffmpeg/xray/Chrome): иначе после
+# force-kill дети остаются сиротами и продолжают грузить CPU/память до остановки контейнера.
+kill_force() {
+  if [ -n "$CHILD" ]; then
+    /bin/kill -KILL -- "-$CHILD" 2>/dev/null || /bin/kill -KILL "$CHILD" 2>/dev/null || true
+  fi
+}
+
 start_xvfb() {
   if [ "${RUTRACKER_HEADED:-0}" = "0" ]; then
     return
@@ -49,8 +57,8 @@ stop_child() {
       i=$((i + 1))
     done
     if is_alive; then
-      log "killing PID $CHILD (force)"
-      kill -KILL "$CHILD" 2>/dev/null || true
+      log "killing PID $CHILD (force, process group)"
+      kill_force
     fi
     wait "$CHILD" 2>/dev/null
   fi
@@ -71,8 +79,8 @@ health_monitor() {
       fails=$((fails + 1))
       log "health check failed ($fails/$HEARTBEAT_MAX_FAILS)"
       if [ "$fails" -ge "$HEARTBEAT_MAX_FAILS" ]; then
-        log "app hung - killing PID $CHILD"
-        kill -KILL "$CHILD" 2>/dev/null || true
+        log "app hung - killing PID $CHILD (process group)"
+        kill_force
         fails=0
       fi
     fi
@@ -125,8 +133,15 @@ while :; do
         /data/chrome-profile/SingletonSocket
   log "starting app"
   START_TS=$(date +%s)
-  # shellcheck disable=SC2086
-  $APP_CMD &
+  # Запускаем в отдельной process group (setsid), чтобы kill_force мог убить всю
+  # группу целиком (node + ffmpeg/xray/Chrome), а не только лидера.
+  if command -v setsid >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    setsid $APP_CMD &
+  else
+    # shellcheck disable=SC2086
+    $APP_CMD &
+  fi
   CHILD=$!
   wait "$CHILD"
   code=$?

@@ -2116,3 +2116,94 @@ button {
     padding: 0 16px;
   }
 }
+
+/* ---------- локальный плеер (magnet/.torrent) ---------- */
+.local-page {
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.local-head {
+  max-width: 720px;
+  margin: 0 auto 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.local-name {
+  width: 100%;
+  height: 46px;
+  padding: 0 18px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 17px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.local-name:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.local-hint {
+  color: var(--text-dim);
+  font-size: 13px;
+  padding: 0 6px;
+}
+
+/* Закреплённый .torrent в поле поиска (до Enter) */
+.search-pending {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 8px 10px 8px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent-soft);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font-size: 14px;
+  z-index: 5;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.search-pending:hover {
+  border-color: var(--accent);
+  background: var(--surface-hover);
+}
+
+.search-pending-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-pending-x {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 8px;
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.search-pending-x:hover {
+  color: var(--accent);
+  background: var(--surface-hover);
+}
+

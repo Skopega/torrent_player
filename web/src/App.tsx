@@ -7,15 +7,25 @@ import { CacheButton } from './components/CacheButton';
 import { ProxyDropdown } from './components/ProxyDropdown';
 import { ResultsGrid } from './components/ResultsGrid';
 import { DetailPage } from './components/DetailPage';
+import { LocalPage } from './components/LocalPage';
 import { FilterBar } from './components/FilterBar';
 
-type View = { name: 'home' } | { name: 'detail'; id: number };
+type View = { name: 'home' } | { name: 'detail'; id: number } | { name: 'local'; id: number };
 
 function parseHash(): View {
+  const local = window.location.hash.match(/^#\/local\/(-?\d+)/);
+  if (local) return { name: 'local', id: Number(local[1]) };
   const m = window.location.hash.match(/^#\/topic\/(\d+)/);
   if (m) return { name: 'detail', id: Number(m[1]) };
   return { name: 'home' };
 }
+
+// Magnet-ссылка в поле поиска: при Enter переходим на страницу локального плеера.
+function isMagnetLink(s: string): boolean {
+  return /^magnet:\?/i.test(s.trim()) && /(?:^|[?&])xt=urn:btih:/i.test(s.trim());
+}
+
+const isTorrentFile = (f: File): boolean => /\.torrent$/i.test(f.name);
 
 const RES_RANK: Record<string, number> = {
   '4K': 5,
@@ -64,17 +74,23 @@ export default function App() {
   const abortRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  // Drop .torrent в поле поиска: файл «закрепляется» до нажатия Enter.
+  const [pendingTorrent, setPendingTorrent] = useState<File | null>(null);
 
+  // История — источник истины на сервере: перечитываем её при каждом возврате на
+  // главную (после локального magnet/.torrent просмотра запись создаётся на
+  // сервере асинхронно, и локальный стейт без refresh был бы устаревшим).
   useEffect(() => {
+    if (view.name !== 'home') return;
     api
       .history()
       .then(setHistory)
       .catch(() => {});
-  }, []);
+  }, [view.name]);
 
   useEffect(() => {
     const ids = history
-      .filter((e) => !e.duration && !e.enrichTried)
+      .filter((e) => !e.duration && !e.enrichTried && e.kind !== 'local')
       .map((e) => e.id);
     if (ids.length === 0) return;
     api
@@ -158,7 +174,7 @@ export default function App() {
   }, [searchOpen]);
 
   useEffect(() => {
-    if (view.name === 'detail') setSearchOpen(false);
+    if (view.name === 'detail' || view.name === 'local') setSearchOpen(false);
   }, [view.name]);
 
   const runSearch = useCallback(async (raw: string) => {
@@ -177,7 +193,10 @@ export default function App() {
 
     // Если находимся на странице раздачи — вернуться на главную, чтобы
     // показать сетку результатов.
-    if (window.location.hash.startsWith('#/topic/')) {
+    if (
+      window.location.hash.startsWith('#/topic/') ||
+      window.location.hash.startsWith('#/local/')
+    ) {
       window.location.hash = '/';
     }
 
@@ -202,6 +221,7 @@ export default function App() {
     abortRef.current = null;
     requestIdRef.current++;
     setQuery('');
+    setPendingTorrent(null);
     setResults(null);
     setError(null);
     setLoading(false);
@@ -215,6 +235,7 @@ export default function App() {
     abortRef.current = null;
     requestIdRef.current++;
     setLoading(false);
+    setError(null);
   }, []);
 
   const scheduleEnrich = useCallback(
@@ -225,7 +246,7 @@ export default function App() {
       if (to <= from) return;
       scheduledRef.current = to;
       const ids = results.slice(from, to).map((r) => r.id);
-      api.enrich(ids).then((m) => setExtra((p) => ({ ...p, ...m })));
+      api.enrich(ids).then((m) => setExtra((p) => ({ ...p, ...m }))).catch(() => {});
     },
     [results],
   );
@@ -242,7 +263,7 @@ export default function App() {
       if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
       hoverTimerRef.current = window.setTimeout(() => {
         const ids = pendingRef.current.splice(0);
-        if (ids.length) api.enrich(ids).then((m) => setExtra((p) => ({ ...p, ...m })));
+        if (ids.length) api.enrich(ids).then((m) => setExtra((p) => ({ ...p, ...m }))).catch(() => {});
       }, 120);
     },
     [extra],
@@ -326,7 +347,57 @@ export default function App() {
   }, [filteredResults, sortKey, sortDir]);
 
   const openTopic = (id: number) => {
-    window.location.hash = `/topic/${id}`;
+    window.location.hash = id < 0 ? `/local/${id}` : `/topic/${id}`;
+  };
+
+  const openLocal = (id: number) => {
+    window.location.hash = `/local/${id}`;
+  };
+
+  // Enter в поиске: magnet → локальный плеер; закреплённый .torrent → локальный
+  // плеер; иначе обычный поиск по rutracker.
+  const onSearchSubmit = async () => {
+    const q = query.trim();
+    if (pendingTorrent) {
+      const file = pendingTorrent;
+      setPendingTorrent(null);
+      setQuery('');
+      setLoading(true);
+      setError(null);
+      try {
+        const info = await api.localTorrent(file);
+        setLoading(false);
+        openLocal(info.id);
+      } catch (e) {
+        setLoading(false);
+        setError(e instanceof Error ? e.message : 'Не удалось добавить .torrent.');
+      }
+      return;
+    }
+    if (isMagnetLink(q)) {
+      setLoading(true);
+      setError(null);
+      try {
+        const info = await api.localMagnet(q);
+        setQuery('');
+        setLoading(false);
+        openLocal(info.id);
+      } catch (e) {
+        setLoading(false);
+        setError(e instanceof Error ? e.message : 'Не удалось добавить magnet.');
+      }
+      return;
+    }
+    runSearch(q);
+  };
+
+  const onSearchDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files?.[0];
+    if (file && isTorrentFile(file)) {
+      setPendingTorrent(file);
+      setError(null);
+    }
   };
 
   return (
@@ -358,12 +429,22 @@ export default function App() {
           </svg>
         </button>
         <div className="search-wrap">
-          <div className="search">
+          <div
+            className="search"
+            onDragOver={(e) => {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = 'copy';
+            }}
+            onDrop={onSearchDrop}
+          >
             <button
               className="search-close"
               aria-label="Закрыть поиск"
               title="Закрыть поиск"
-              onClick={() => setSearchOpen(false)}
+              onClick={() => {
+                setSearchOpen(false);
+                setPendingTorrent(null);
+              }}
             >
               <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M18 6 6 18M6 6l12 12" strokeLinecap="round" />
@@ -374,15 +455,39 @@ export default function App() {
               value={query}
               onChange={(e) => onChangeQuery(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') runSearch(query);
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void onSearchSubmit();
+                }
               }}
-              placeholder="Поиск"
+              placeholder="Поиск/magnet/drag n drop .torrent"
             />
+            {pendingTorrent && (
+              <div
+                className="search-pending"
+                role="button"
+                title="Добавить .torrent"
+                onClick={() => void onSearchSubmit()}
+              >
+                <span className="search-pending-name">{pendingTorrent.name}</span>
+                <button
+                  className="search-pending-x"
+                  aria-label="Убрать файл"
+                  title="Убрать файл"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setPendingTorrent(null);
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            )}
             <button
               className="search-go"
               aria-label="Найти"
               title="Найти"
-              onClick={() => runSearch(query)}
+              onClick={() => void onSearchSubmit()}
             >
               <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
                 <circle cx="11" cy="11" r="7" />
@@ -401,6 +506,8 @@ export default function App() {
       <main className="main">
         {view.name === 'detail' ? (
           <DetailPage id={view.id} onBack={() => (window.location.hash = '/')} onWatched={addToHistory} />
+        ) : view.name === 'local' ? (
+          <LocalPage key={view.id} id={view.id} onBack={() => (window.location.hash = '/')} />
         ) : (
           <>
             {results && results.length > 0 && (

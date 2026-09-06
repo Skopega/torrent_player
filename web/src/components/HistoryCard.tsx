@@ -64,7 +64,7 @@ export function HistoryCard({
         )}
         <div className="card-bottom">
           <div className="meta">
-            <Badge tone="seeds">{e.seeds}</Badge>
+            {e.kind !== 'local' && <Badge tone="seeds">{e.seeds}</Badge>}
             {e.resolution && <Badge tone="res">{e.resolution}</Badge>}
             {e.bitrate && <Badge tone="bitrate">{e.bitrate}</Badge>}
             <Badge tone="size">{e.sizeHuman}</Badge>

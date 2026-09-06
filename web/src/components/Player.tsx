@@ -143,7 +143,15 @@ function trackLabel(t: TrackInfo, i: number, kind: 'audio' | 'sub'): string {
   return parts.length ? parts.join(' · ') : `Дорожка ${i + 1}`;
 }
 
-export function Player({ topicId }: { topicId: number }) {
+export function Player({
+  topicId,
+  onFirstPlay,
+}: {
+  topicId: number;
+  // Вызывается один раз на первый фактический play (для локальных раздач — сигнал
+  // серверу создать запись истории и сгенерировать баннер).
+  onFirstPlay?: (topicId: number, fileIndex: number) => void;
+}) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const seekRef = useRef<HTMLDivElement>(null);
@@ -180,12 +188,19 @@ export function Player({ topicId }: { topicId: number }) {
   const pendingPrefsRef = useRef<{ volume: number; muted: boolean } | null>(null);
   // Выбранные в истории дорожки (озвучка/субтитры): применяются к каждому файлу
   // (серии) при probe; обновляются при выборе в меню и сохраняются на сервер.
-  const avPrefsRef = useRef<{ audioTrack: number | null; subtitleTrack: number | null }>({
+  const avPrefsRef = useRef<{ audioTrack: number | null; subtitleTrack: number | null; resCeiling: number | null }>({
     audioTrack: null,
     subtitleTrack: null,
+    resCeiling: null,
   });
   // Последний сохранённый прогресс (для дедупликации записей на интервале).
   const lastSavedResumeRef = useRef<{ fileIndex: number; position: number } | null>(null);
+  // Одноразовый сигнал «просмотр начался» для локальных раздач (создание истории).
+  const firstPlaySentRef = useRef(false);
+  const onFirstPlayRef = useRef<((topicId: number, fileIndex: number) => void) | null>(null);
+  useEffect(() => {
+    onFirstPlayRef.current = onFirstPlay ?? null;
+  });
 
   const [files, setFiles] = useState<StreamFile[] | null>(null);
   const [fileIndex, setFileIndex] = useState<number | null>(null);
@@ -265,12 +280,32 @@ export function Player({ topicId }: { topicId: number }) {
 
   useEffect(() => {
     let cancelled = false;
+    firstPlaySentRef.current = false;
     setLoading(true);
     setError(null);
     setFiles(null);
     setFileIndex(null);
     setMedia(null);
     setStatus(null);
+    // Новая раздача = новый просмотр: громкость/мут не должны наследоваться от
+    // предыдущей (Player может пережить смену topicId без размонтирования).
+    setVolume(1);
+    setMuted(false);
+    setMenuOpen(false);
+    setAudioMenuOpen(false);
+    setSubMenuOpen(false);
+    setSettingsOpen(false);
+    const prevVideo = videoRef.current;
+    if (prevVideo) {
+      try {
+        prevVideo.pause();
+        prevVideo.currentTime = 0;
+        prevVideo.muted = false;
+        prevVideo.volume = 1;
+      } catch {
+        /* ignore */
+      }
+    }
     // Параллельно со списком файлов спрашиваем, с какой серии продолжить (раздача
     // в истории): сервер — источник истины, поэтому работает и по прямой ссылке.
     Promise.all([
@@ -282,6 +317,7 @@ export function Player({ topicId }: { topicId: number }) {
         muted: null,
         audioTrack: null,
         subtitleTrack: null,
+        resCeiling: null,
       })),
     ])
       .then(([f, resume]) => {
@@ -295,6 +331,7 @@ export function Player({ topicId }: { topicId: number }) {
         avPrefsRef.current = {
           audioTrack: resume.audioTrack ?? null,
           subtitleTrack: resume.subtitleTrack ?? null,
+          resCeiling: resume.resCeiling ?? null,
         };
         const target =
           resume.fileIndex != null ? f.find((x) => x.index === resume.fileIndex && x.isVideo) : null;
@@ -380,8 +417,16 @@ export function Player({ topicId }: { topicId: number }) {
           setSubWindowStart(0);
           resumeRealRef.current = null;
         }
-        // По умолчанию — максимальное качество (выше исходника сервер и так не масштабирует).
-        setResSel(maxResFor(m.height));
+        // По умолчанию — максимальное качество. Если в истории сохранён потолок
+        // транскода и он валиден для этого файла (не выше его полного качества) —
+        // восстанавливаем его.
+        const savedRes = avPrefsRef.current.resCeiling;
+        const fullRes = maxResFor(m.height);
+        setResSel(
+          savedRes != null && RES_OPTIONS.includes(savedRes) && savedRes <= fullRes
+            ? savedRes
+            : fullRes,
+        );
         mediaFileRef.current = fileIndex;
         setMedia(m);
         setLoading(false);
@@ -432,6 +477,9 @@ export function Player({ topicId }: { topicId: number }) {
           if (v) v.currentTime = resumeReal;
         };
         video.addEventListener('loadedmetadata', nativeRestore);
+      }
+      if (shouldAutoPlay) {
+        video.play().catch(() => {});
       }
     } else if (Hls.isSupported()) {
       const hls = new Hls({
@@ -535,6 +583,9 @@ export function Player({ topicId }: { topicId: number }) {
         };
         video.addEventListener('loadedmetadata', nativeRestore);
       }
+      if (shouldAutoPlay) {
+        video.play().catch(() => {});
+      }
     } else {
       setError('HLS не поддерживается этим браузером.');
     }
@@ -568,6 +619,11 @@ export function Player({ topicId }: { topicId: number }) {
     const onPlaying = () => {
       setPlaying(true);
       setBuffering(false);
+      if (!firstPlaySentRef.current && fileIndex != null) {
+        firstPlaySentRef.current = true;
+        const cb = onFirstPlayRef.current;
+        if (cb) cb(topicId, fileIndex);
+      }
       finishSeek();
     };
     const onPause = () => setPlaying(false);
@@ -635,7 +691,7 @@ export function Player({ topicId }: { topicId: number }) {
       video.removeEventListener('error', onErr);
       video.removeEventListener('stalled', onStalled);
     };
-  }, [topicId, fileIndex, media, loading]);
+  }, [topicId, fileIndex, media, loading, retryNonce]);
 
   useEffect(() => {
     if (subSel === 0 || !media) return;
@@ -725,7 +781,7 @@ export function Player({ topicId }: { topicId: number }) {
         .catch(() => {});
     };
     tick();
-    const iv = window.setInterval(tick, 1500);
+    const iv = window.setInterval(tick, 20000);
     return () => {
       alive = false;
       ac.abort();
@@ -981,7 +1037,9 @@ const toggleFullscreen = () => {
     const real = sessionStart + (video?.currentTime ?? 0);
     autoPlayRef.current = !video?.paused;
     resumeRealRef.current = real;
+    avPrefsRef.current = { ...avPrefsRef.current, resCeiling: r };
     setResSel(r);
+    api.historySetRes(topicId, r).catch(() => {});
     setSessionStart(roundStart(real));
     setCurrentTime(0);
     setSubWindowStart(Math.max(0, real - SUB_LEAD));

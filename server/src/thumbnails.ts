@@ -15,7 +15,7 @@ export const THUMB_INTERVAL_SEC = 10;
 export const THUMB_PARALLEL_SEC = 60;
 const THUMB_WIDTH = 160;
 const THUMB_DIR = path.join(DATA_DIR, 'cache', 'thumbnails');
-const STREAM_BASE = 'http://127.0.0.1:3000';
+const STREAM_BASE = `http://127.0.0.1:${Number(process.env.TP_PORT) || 3000}`;
 const PROGRESS_LOG_MS = 15000;
 const RESUME_CHECK_MS = 10000;
 // Жёсткий потолок на один ffmpeg-процесс превью: если он завис (feed не качается,
@@ -836,6 +836,54 @@ export class ThumbnailManager {
 
   private delay(ms: number): Promise<void> {
     return new Promise((r) => setTimeout(r, ms));
+  }
+
+  // Список уже сгенерированных слотов файла (сортированный).
+  private slotsOnDisk(topicId: number, fileIndex: number): number[] {
+    const out: number[] = [];
+    try {
+      for (const e of fs.readdirSync(this.dirFor(topicId, fileIndex))) {
+        const m = /^thumb(\d{6})\.jpg$/.exec(e);
+        if (m) out.push(Number(m[1]));
+      }
+    } catch {
+      /* нет каталога */
+    }
+    return out.sort((a, b) => a - b);
+  }
+
+  // Возвращает случайный готовый кадр из средней полосы таймлайна [10%..90%]
+  // (первые/последние 10% — типично чёрные/логотипы — не кандидаты на баннер).
+  // Ждёт появления хотя бы пары кадров полосы (генерация уже идёт параллельно
+  // просмотру), затем выбирает случайный. null — не успели / длительность неизвестна.
+  async bannerFrame(topicId: number, fileIndex: number): Promise<string | null> {
+    let total = 0;
+    try {
+      const media = await this.stream.probe(topicId, fileIndex);
+      const dur = media.durationSec ?? 0;
+      total = dur > 0 ? Math.ceil(dur / THUMB_INTERVAL_SEC) : 0;
+    } catch {
+      /* probe может не успеть до метаданных */
+    }
+    if (total <= 0) return null;
+    const lo = Math.floor(total * 0.1);
+    const hi = Math.max(lo + 1, Math.floor(total * 0.9) - 1);
+    if (hi <= lo) return null;
+
+    this.ensure(topicId, fileIndex);
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      const band = this.slotsOnDisk(topicId, fileIndex).filter((s) => s >= lo && s <= hi);
+      if (band.length >= 2) {
+        const pick = band[Math.floor(Math.random() * band.length)];
+        return path.join(this.dirFor(topicId, fileIndex), `thumb${String(pick).padStart(6, '0')}.jpg`);
+      }
+      await this.delay(3000);
+    }
+    const band = this.slotsOnDisk(topicId, fileIndex).filter((s) => s >= lo && s <= hi);
+    if (band.length === 0) return null;
+    const pick = band[Math.floor(Math.random() * band.length)];
+    return path.join(this.dirFor(topicId, fileIndex), `thumb${String(pick).padStart(6, '0')}.jpg`);
   }
 
   // Валидирует имя файла превью и возвращает его абсолютный путь (null — иначе).

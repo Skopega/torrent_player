@@ -21,6 +21,9 @@ export interface HistoryEntry {
   bitrate: string | null;
   duration: string | null;
   date: string;
+  // Локальные magnet/.torrent раздачи: id отрицательный, источник живёт в
+  // отдельном персистентном хранилище (data/local), а не в кеше rutracker.
+  kind?: 'local';
   // Настройки просмотра, живут в записи истории — удаление записи автоматически
   // «забывает» их:
   // - «Продолжить с последней серии»: индекс последнего запущенного видеофайла и
@@ -33,9 +36,12 @@ export interface HistoryEntry {
   muted?: boolean;
   audioTrack?: number | null;
   subtitleTrack?: number | null;
+  // Выбранный потолок качества транскода (высота в px: 2160/1440/1080/720/480/360).
+  // null = не задан (использовать полное качество исходника).
+  resCeiling?: number | null;
 }
 
-const HISTORY_MAX = 10;
+const HISTORY_MAX = 20;
 // «Битая» картинка — не навсегда: временный 404 (fastpic бот-детект, протухшая
 // сессия, rate-limit) не должен отравлять URL вечно.
 const FAILED_IMAGE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -82,7 +88,7 @@ function dirSize(dir: string): number {
   return total;
 }
 
-function ensureDir(dir: string) {
+export function ensureDir(dir: string) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
@@ -181,7 +187,7 @@ function readRecord(file: string): Record<string, unknown> {
   return v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
 }
 
-function writeJson(file: string, data: unknown) {
+export function writeJson(file: string, data: unknown) {
   ensureDir(path.dirname(file));
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8');
@@ -280,6 +286,7 @@ export class Store {
       if (merged.muted == null) merged.muted = prev.muted;
       if (merged.audioTrack == null) merged.audioTrack = prev.audioTrack;
       if (merged.subtitleTrack == null) merged.subtitleTrack = prev.subtitleTrack;
+      if (merged.resCeiling == null) merged.resCeiling = prev.resCeiling;
     }
     this.history = [merged, ...this.history.filter((e) => e.id !== entry.id)].slice(0, HISTORY_MAX);
     writeJson(HISTORY_FILE, this.history);
@@ -292,6 +299,16 @@ export class Store {
     return this.history;
   }
 
+  // Точечное обновление записи истории (например, title/постер после генерации
+  // баннера локальной раздачи). Не переупорядочивает список.
+  updateHistory(id: number, patch: Partial<HistoryEntry>): boolean {
+    const e = this.history.find((x) => x.id === id);
+    if (!e) return false;
+    Object.assign(e, patch);
+    writeJson(HISTORY_FILE, this.history);
+    return true;
+  }
+
   getHistoryResume(id: number): {
     fileIndex: number | null;
     position: number | null;
@@ -299,6 +316,7 @@ export class Store {
     muted: boolean | null;
     audioTrack: number | null;
     subtitleTrack: number | null;
+    resCeiling: number | null;
   } {
     const e = this.history.find((x) => x.id === id);
     if (!e) {
@@ -309,6 +327,7 @@ export class Store {
         muted: null,
         audioTrack: null,
         subtitleTrack: null,
+        resCeiling: null,
       };
     }
     return {
@@ -318,6 +337,7 @@ export class Store {
       muted: e.muted ?? null,
       audioTrack: e.audioTrack ?? null,
       subtitleTrack: e.subtitleTrack ?? null,
+      resCeiling: e.resCeiling ?? null,
     };
   }
 
@@ -348,6 +368,15 @@ export class Store {
     if (!e) return false;
     e.audioTrack = audioTrack;
     e.subtitleTrack = subtitleTrack;
+    writeJson(HISTORY_FILE, this.history);
+    return true;
+  }
+
+  // Выбранный потолок качества транскода (null = полное качество исходника).
+  setHistoryRes(id: number, resCeiling: number | null): boolean {
+    const e = this.history.find((x) => x.id === id);
+    if (!e) return false;
+    e.resCeiling = resCeiling;
     writeJson(HISTORY_FILE, this.history);
     return true;
   }

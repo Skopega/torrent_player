@@ -6,9 +6,10 @@ import { fileURLToPath } from 'node:url';
 import { Services } from './services.js';
 import { createApi } from './api.js';
 import { log } from './logger.js';
+import { sameOriginGuard } from './csrf.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = 3000;
+const PORT = Number(process.env.TP_PORT) || 3000;
 
 function lanAddresses(): string[] {
   const out: string[] = [];
@@ -50,9 +51,15 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/shutdown', (_req, res) => {
+app.post('/api/shutdown', sameOriginGuard, (_req, res) => {
   res.json({ ok: true });
   void shutdown();
+});
+
+// Неизвестные /api/*-маршруты отвечают JSON-404, а не index.html (SPA-fallback ниже)
+// — иначе опечатка в пути API маскировалась бы под «успешный» HTML-ответ.
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'not found' });
 });
 
 const webDist = process.env.TP_WEB_DIST

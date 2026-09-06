@@ -4,6 +4,7 @@ title Torrent Player Setup
 cd /d "%~dp0"
 
 set "NODE_VER=22.23.2"
+set "NODE_SHA256=1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97"
 
 rem ---- Node.js (portable) ----
 if not exist "runtime\node\node.exe" (
@@ -12,6 +13,9 @@ if not exist "runtime\node\node.exe" (
     if not exist "runtime" mkdir "runtime"
     powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri 'https://nodejs.org/dist/v%NODE_VER%/node-v%NODE_VER%-win-x64.zip' -OutFile 'runtime\node.zip'"
     if errorlevel 1 ( echo [ERROR] Node download failed. & pause & exit /b 1 )
+    echo Verifying SHA-256...
+    powershell -NoProfile -Command "if ((Get-FileHash -Algorithm SHA256 'runtime\node.zip').Hash.ToLower() -ne '%NODE_SHA256%') { Write-Error 'SHA256 mismatch' ; exit 1 }"
+    if errorlevel 1 ( echo [ERROR] Node checksum mismatch - aborting. & del /q "runtime\node.zip" >nul 2>nul & pause & exit /b 1 )
     powershell -NoProfile -Command "Expand-Archive 'runtime\node.zip' 'runtime' -Force; Rename-Item 'runtime\node-v%NODE_VER%-win-x64' 'node' -Force"
     del /q "runtime\node.zip" >nul 2>nul
 ) else ( echo [1/5] Node.js present. )

@@ -38,6 +38,8 @@ export interface HistoryEntry {
   duration: string | null;
   enrichTried?: boolean;
   date: string;
+  // Локальная magnet/.torrent раздача (id отрицательный, источник в data/local).
+  kind?: 'local';
   // Последняя запущенная серия и позиция в ней (заполняются сервером).
   lastFileIndex?: number;
   lastPosition?: number;
@@ -47,6 +49,8 @@ export interface HistoryEntry {
   // Выбранные дорожки: аудио-поток и поток субтитров (null = off).
   audioTrack?: number | null;
   subtitleTrack?: number | null;
+  // Выбранный потолок качества транскода (высота в px), null = полное качество.
+  resCeiling?: number | null;
 }
 
 export interface HistoryResume {
@@ -56,6 +60,14 @@ export interface HistoryResume {
   muted: boolean | null;
   audioTrack: number | null;
   subtitleTrack: number | null;
+  resCeiling: number | null;
+}
+
+export interface LocalInfo {
+  id: number;
+  name: string;
+  kind: 'magnet' | 'torrent';
+  hasBanner: boolean;
 }
 
 export interface TopicField {

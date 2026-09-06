@@ -546,8 +546,14 @@ export function blocksToCues(blocks: ParsedBlock[], codec: string | null): Subti
   return out;
 }
 
+// Не даём тексту куи разорвать структуру WebVTT: схлопываем пустые строки (иначе
+// текст с \n\n разбивает cue-блок и дальше можно подсунуть фейковую строку тайминга).
+function sanitizeCueText(text: string): string {
+  return text.replace(/\r\n?/g, '\n').replace(/\n{2,}/g, '\n').trim();
+}
+
 export function cuesToVttText(cues: SubtitleCue[]): string {
-  const blocks = cues.map((c) => `${fmtTime(c.start)} --> ${fmtTime(c.end)}\n${c.text}`);
+  const blocks = cues.map((c) => `${fmtTime(c.start)} --> ${fmtTime(c.end)}\n${sanitizeCueText(c.text)}`);
   return 'WEBVTT\n\n' + blocks.join('\n\n');
 }
 
@@ -567,7 +573,7 @@ export function formatWindowVtt(
     let e = c.end - shiftSec;
     if (e <= 0) continue;
     if (s < 0) s = 0;
-    out.push(`${fmtTime(s)} --> ${fmtTime(e)}\n${c.text}`);
+    out.push(`${fmtTime(s)} --> ${fmtTime(e)}\n${sanitizeCueText(c.text)}`);
   }
   return 'WEBVTT\n\n' + out.join('\n\n');
 }

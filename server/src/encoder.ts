@@ -26,7 +26,10 @@ const NVENC: EncoderConfig = {
   // Декод и конвертация 10-bit -> 8-bit остаются в VRAM (-hwaccel_output_format
   // cuda + scale_cuda), иначе p010le -> yuv420p гонится через CPU swscale на 4K
   // (~250 млн пикселей/с) и транскод не успевает за реальным временем.
-  hwaccelArgs: () => ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'],
+  // -threads 1 ограничивает число decode-поверхностей nvdec (иначе на 4K H.264/HEVC
+  // с большим числом ref-кадров ffmpeg просит >32 поверхностей, драйвер отказывает
+  // с CUDA_ERROR_INVALID_VALUE, и транскод падает в libx264).
+  hwaccelArgs: () => ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda', '-threads', '1'],
   videoArgs: (gop) => [
     '-c:v', 'h264_nvenc',
     // p4 быстрее p5, cq выше — больше запаса для 4K в реальном времени.

@@ -68,7 +68,13 @@ export function SmartImage({ src, alt }: { src: string | null; alt?: string }) {
       {visible && (
         <img
           key={attempt}
-          src={posterUrl(src) + (attempt > 0 ? `&_r=${attempt}` : '')}
+          src={
+            // Локальные баннеры (/api/local/...) отдаются с нашего origin напрямую;
+            // внешние постеры — через серверный прокси.
+            src.startsWith('/api/')
+              ? src
+              : posterUrl(src) + (attempt > 0 ? `&_r=${attempt}` : '')
+          }
           alt={alt}
           loading="lazy"
           onLoad={() => setLoaded(true)}

@@ -9,6 +9,11 @@ test('parseHlsDir parses topicId and fileIndex', () => {
   assert.deepEqual(parseHlsDir('1_0_def_0_full'), { topicId: 1, fileIndex: 0 });
 });
 
+test('parseHlsDir parses negative (local) topic ids', () => {
+  assert.deepEqual(parseHlsDir('-3_0_1_0_1080'), { topicId: -3, fileIndex: 0 });
+  assert.deepEqual(parseHlsDir('-12_4_11_2406_2160'), { topicId: -12, fileIndex: 4 });
+});
+
 test('parseHlsDir rejects junk and malformed names', () => {
   assert.equal(parseHlsDir(''), null);
   assert.equal(parseHlsDir('onlyone'), null);
@@ -21,6 +26,8 @@ test('parseHlsDir rejects junk and malformed names', () => {
 test('parseThumbDir parses topicId and fileIndex', () => {
   assert.deepEqual(parseThumbDir('4301725_52'), { topicId: 4301725, fileIndex: 52 });
   assert.deepEqual(parseThumbDir('6829503_0'), { topicId: 6829503, fileIndex: 0 });
+  assert.deepEqual(parseThumbDir('-5_0'), { topicId: -5, fileIndex: 0 });
+  assert.deepEqual(parseThumbDir('-5_2'), { topicId: -5, fileIndex: 2 });
 });
 
 test('parseThumbDir rejects junk', () => {

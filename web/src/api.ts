@@ -3,6 +3,7 @@ import type {
   EnrichEntry,
   HistoryEntry,
   HistoryResume,
+  LocalInfo,
   LoginResult,
   MediaInfo,
   SearchResult,
@@ -207,6 +208,68 @@ export const api = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ audioTrack, subtitleTrack }),
       }),
+    );
+  },
+
+  async historySetRes(topicId: number, resCeiling: number | null): Promise<void> {
+    await json<{ ok: boolean }>(
+      await fetch(`/api/history/${topicId}/res`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resCeiling }),
+      }),
+    );
+  },
+
+  async localMagnet(magnet: string): Promise<LocalInfo> {
+    const body = await json<LocalInfo>(
+      await fetch('/api/local/magnet', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ magnet }),
+      }),
+    );
+    return body;
+  },
+
+  async localTorrent(file: File): Promise<LocalInfo> {
+    const body = await json<LocalInfo>(
+      await fetch('/api/local/torrent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-bittorrent' },
+        body: file,
+      }),
+    );
+    return body;
+  },
+
+  async localInfo(id: number): Promise<LocalInfo> {
+    return json(await fetch(`/api/local/${id}`));
+  },
+
+  async localRename(id: number, name: string): Promise<LocalInfo> {
+    return json(
+      await fetch(`/api/local/${id}/name`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      }),
+    );
+  },
+
+  async localWatch(id: number, opts: { name?: string; fileIndex?: number | null }): Promise<void> {
+    await json<{ ok: boolean }>(
+      await fetch(`/api/local/${id}/watch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      }),
+    );
+  },
+
+  async localClose(id: number): Promise<void> {
+    await json<{ ok: boolean }>(
+      await fetch(`/api/local/${id}/close`, { method: 'POST' }),
     );
   },
 

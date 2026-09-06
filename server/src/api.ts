@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, raw as rawBody } from 'express';
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import fs from 'node:fs';
 import { ImageFetchError } from './images.js';
@@ -9,6 +9,7 @@ import { mimeFor, parseRangeHeader } from './stream-utils.js';
 import { formatWindowVtt } from './mkv.js';
 import { perf } from './perf.js';
 import { assertSafeHttpUrl } from './url-safe.js';
+import { sameOriginGuard } from './csrf.js';
 import { THUMB_INTERVAL_SEC, THUMB_NEAREST_WINDOW_SLOTS } from './thumbnails.js';
 
 // Кэп на один Direct Play ответ: браузер просит `bytes=0-` (весь файл), но мы
@@ -669,16 +670,22 @@ export function createApi(services: Services): Router {
       duration: b.duration == null ? null : String(b.duration),
       date: String(b.date ?? ''),
     };
-    res.json({ history: services.store.addHistory(entry) });
+    res.json({ history: services.historyAdd(entry) });
   });
 
-  api.delete('/history/:id', (req, res) => {
+  api.delete('/history/:id', async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) {
       res.status(400).json({ error: 'bad id' });
       return;
     }
-    res.json({ history: services.store.removeHistory(id) });
+    try {
+      const history = await services.removeHistoryEntry(id);
+      res.json({ history });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'history error';
+      res.status(502).json({ error: msg });
+    }
   });
 
   api.get('/history/:id/resume', (req, res) => {
@@ -742,11 +749,148 @@ export function createApi(services: Services): Router {
     res.json({ ok: true });
   });
 
+  api.post('/history/:id/res', (req, res) => {
+    const id = Number(req.params.id);
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const resCeiling = b.resCeiling == null ? null : Number(b.resCeiling);
+    const valid = (v: number | null) => v == null || (Number.isFinite(v) && v > 0);
+    if (!Number.isFinite(id) || !valid(resCeiling)) {
+      res.status(400).json({ error: 'bad res' });
+      return;
+    }
+    services.store.setHistoryRes(id, resCeiling);
+    res.json({ ok: true });
+  });
+
+  // --- Локальные magnet/.torrent раздачи ---------------------------------------
+
+  function parseLocalId(req: Request): number | null {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id >= 0) return null;
+    return id;
+  }
+
+  // Регистрация magnet-ссылки из поля поиска.
+  api.post('/local/magnet', ah(async (req, res) => {
+    const magnet = String((req.body ?? {}).magnet ?? '').trim();
+    if (!magnet) {
+      res.status(400).json({ error: 'Нужна magnet-ссылка.' });
+      return;
+    }
+    try {
+      const meta = await services.addLocalMagnet(magnet);
+      res.json({ id: meta.id, name: meta.name });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'magnet error';
+      res.status(400).json({ error: msg === 'bad_magnet' ? 'Это не похоже на magnet-ссылку.' : msg });
+    }
+  }));
+
+  // Регистрация .torrent (raw body) из drag-n-drop.
+  api.post('/local/torrent', rawBody({ type: () => true, limit: '20mb' }), ah(async (req, res) => {
+    const buf = (req.body as Buffer | undefined) ?? Buffer.alloc(0);
+    if (!Buffer.isBuffer(buf) || buf.length === 0) {
+      res.status(400).json({ error: 'Пустой .torrent файл.' });
+      return;
+    }
+    try {
+      const meta = await services.addLocalTorrent(buf);
+      res.json({ id: meta.id, name: meta.name });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'torrent error';
+      res.status(400).json({ error: msg === 'bad_torrent' ? 'Файл не похож на .torrent.' : msg });
+    }
+  }));
+
+  api.get('/local/:id', (req, res) => {
+    const id = parseLocalId(req);
+    const meta = id != null ? services.local.getByTopicId(id) : null;
+    if (!meta) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json({ id: meta.id, name: meta.name, kind: meta.kind, hasBanner: meta.hasBanner });
+  });
+
+  api.post('/local/:id/name', (req, res) => {
+    const id = parseLocalId(req);
+    if (id == null) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    const name = String((req.body ?? {}).name ?? '').trim();
+    if (!name) {
+      res.status(400).json({ error: 'Нужно имя.' });
+      return;
+    }
+    const meta = services.renameLocal(id, name);
+    if (!meta) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json({ id: meta.id, name: meta.name });
+  });
+
+  // Старт просмотра: создаёт/обновляет запись истории (+ фоновая генерация баннера).
+  api.post('/local/:id/watch', ah(async (req, res) => {
+    const id = parseLocalId(req);
+    if (id == null) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    if (!services.local.getByTopicId(id)) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const name = b.name == null ? undefined : String(b.name);
+    let fileIndex: number | null = null;
+    if (b.fileIndex != null) {
+      const fi = Number(b.fileIndex);
+      if (!Number.isFinite(fi) || fi < 0) {
+        res.status(400).json({ error: 'bad fileIndex' });
+        return;
+      }
+      fileIndex = fi;
+    }
+    const history = await services.watchLocal(id, { name, fileIndex });
+    res.json({ ok: true, history });
+  }));
+
+  // Страницу закрыли до начала просмотра — источник удаляется (записи истории нет).
+  api.post('/local/:id/close', ah(async (req, res) => {
+    const id = parseLocalId(req);
+    if (id == null) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    const removed = await services.closeLocal(id);
+    res.json({ ok: true, removed });
+  }));
+
+  // Баннер локальной раздачи (постер в карточке истории).
+  api.get('/local/:id/banner', (req, res) => {
+    const id = parseLocalId(req);
+    const meta = id != null ? services.local.getByTopicId(id) : null;
+    const p = meta ? services.local.bannerPath(meta.id) : null;
+    if (!p || !fs.existsSync(p)) {
+      res.status(404).end();
+      return;
+    }
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    const rs = fs.createReadStream(p);
+    rs.on('error', () => {
+      if (!res.writableEnded) res.destroy();
+    });
+    rs.pipe(res);
+  });
+
   api.get('/cache/size', async (_req, res) => {
     res.json({ bytes: await services.store.cacheSizeAsync() });
   });
 
-  api.post('/cache/clear', async (_req, res) => {
+  api.post('/cache/clear', sameOriginGuard, async (_req, res) => {
     try {
       const before = await services.store.cacheSizeAsync();
       await services.clearCache();
@@ -758,7 +902,7 @@ export function createApi(services: Services): Router {
     }
   });
 
-  api.post('/cache/clear-video', async (_req, res) => {
+  api.post('/cache/clear-video', sameOriginGuard, async (_req, res) => {
     try {
       const before = await services.store.cacheSizeAsync();
       await services.clearVideoCache();

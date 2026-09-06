@@ -1,15 +1,56 @@
 import iconv from 'iconv-lite';
-import { fetch as ufetch } from 'undici';
+import { Agent, fetch as ufetch } from 'undici';
 import type { Dispatcher } from 'undici';
+import { lookup } from 'node:dns';
+import type { LookupAddress, LookupOptions } from 'node:dns';
 import { Readable } from 'node:stream';
 import { log } from './logger.js';
 import { resolveUserAgent } from './ua.js';
-import { assertSafeHttpUrl } from './url-safe.js';
+import { assertSafeHttpUrl, isPrivateAddress } from './url-safe.js';
 import type { VpnProxy } from './vpn/types.js';
 
 export const BASE_URL = 'https://rutracker.org/forum/';
 
 export const USER_AGENT = resolveUserAgent();
+
+// DNS-lookup с валидацией на «публичный адрес»: устраняет TOCTOU между проверкой
+// assertSafeHttpUrl и реальным соединением (DNS-rebinding). Соединение выполняется
+// строго на адреса, которые прошли проверку на приватность.
+function safeLookup(
+  hostname: string,
+  options: LookupOptions,
+  callback: (err: NodeJS.ErrnoException | null, address: string | LookupAddress[], family?: number) => void,
+): void {
+  lookup(hostname, { ...options, all: true, verbatim: true }, (err, addresses) => {
+    if (err) {
+      callback(err, '');
+      return;
+    }
+    const list = (Array.isArray(addresses) ? addresses : [addresses]) as LookupAddress[];
+    if (list.some((a) => isPrivateAddress(a.address))) {
+      const e = new Error(`non-public host: ${hostname}`) as NodeJS.ErrnoException;
+      e.code = 'EUNSAFEHOST';
+      callback(e, '');
+      return;
+    }
+    if (options.all) {
+      callback(null, list);
+    } else {
+      const first = list[0];
+      callback(null, first.address, first.family);
+    }
+  });
+}
+
+// Единый safe-агент для прямого (без VPN) трафика: вся выгрузка в интернет
+// проходит через него и не может сконнектиться на приватные адреса.
+let safeAgent: Agent | null = null;
+function safeDispatcher(): Dispatcher {
+  if (!safeAgent) {
+    safeAgent = new Agent({ connect: { lookup: safeLookup } });
+  }
+  return safeAgent;
+}
 
 export interface HttpResponse {
   status: number;
@@ -70,7 +111,7 @@ export class HttpClient {
       }
       return this.vpn.getDispatcher() as Dispatcher | undefined;
     }
-    return undefined;
+    return safeDispatcher();
   }
 
   async request(url: string, init?: RequestInit, opts?: { direct?: boolean }): Promise<HttpResponse> {

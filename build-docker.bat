@@ -40,6 +40,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo Fetching docker build binaries (Chrome/ffmpeg/xray)...
+node scripts\fetch-docker-bin.cjs
+if errorlevel 1 (
+    echo Docker binaries fetch failed.
+    exit /b 1
+)
+
 echo Building Docker image...
 docker build -t torrent-player .
 if errorlevel 1 (

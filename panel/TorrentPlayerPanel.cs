@@ -87,6 +87,7 @@ namespace TorrentPlayerPanel
         private int _backoffIndex;
         private int _heartbeatFails;
         private bool _lastHealthOk;
+        private bool _configReady;
         private string _state = StateStopped;
         private System.Windows.Forms.Timer _restartTimer;
         private readonly System.Windows.Forms.Timer _uptimeTimer;
@@ -121,11 +122,15 @@ namespace TorrentPlayerPanel
             _configPath = Path.Combine(_root, "data", "panel.json");
             _logPath = Path.Combine(_root, "data", "logs", "panel.log");
 
-            _http.Timeout = TimeSpan.FromSeconds(3);
+            // Глобальный таймаут не ставим: все вызовы имеют свой CancellationToken
+            // (health 2-3с, shutdown 4-10с, очистка кеша 180с). Короткий глобальный
+            // таймаут рвал долгую очистку кеша (TaskCanceledException до её завершения).
+            _http.Timeout = Timeout.InfiniteTimeSpan;
 
             BuildUi();
             LoadConfig();
             ApplyConfig();
+            _configReady = true;
             SetupTray();
 
             _uptimeTimer = new System.Windows.Forms.Timer();
@@ -206,10 +211,10 @@ namespace TorrentPlayerPanel
 
             _chkAutoRestart = new CheckBox { Text = "Авто-рестарт при падении", AutoSize = true };
             _chkAutoRestart.Checked = _config.AutoRestart;
-            _chkAutoRestart.CheckedChanged += (s, e) => { _config.AutoRestart = _chkAutoRestart.Checked; };
+            _chkAutoRestart.CheckedChanged += (s, e) => { _config.AutoRestart = _chkAutoRestart.Checked; if (_configReady) SaveConfig(); };
             _chkAutoStart = new CheckBox { Text = "Старт сервера при запуске панели", AutoSize = true };
             _chkAutoStart.Checked = _config.AutoStartOnLaunch;
-            _chkAutoStart.CheckedChanged += (s, e) => { _config.AutoStartOnLaunch = _chkAutoStart.Checked; };
+            _chkAutoStart.CheckedChanged += (s, e) => { _config.AutoStartOnLaunch = _chkAutoStart.Checked; if (_configReady) SaveConfig(); };
 
             var toolbar = new FlowLayoutPanel();
             toolbar.Dock = DockStyle.Top;

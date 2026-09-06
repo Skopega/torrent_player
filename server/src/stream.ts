@@ -31,6 +31,13 @@ export interface StreamManagerSource {
   getMagnet(topicId: number): Promise<string | null>;
 }
 
+// Локальный источник раздачи (magnet/.torrent, без rutracker): либо готовая
+// magnet-строка, либо путь к сохранённому .torrent на диске.
+export interface LocalSourceSpec {
+  magnet?: string;
+  torrentFile?: string;
+}
+
 export interface OpenStreamOptions {
   start?: number;
   end?: number;
@@ -81,6 +88,9 @@ export class StreamManager {
   private dhtSaveTimer: NodeJS.Timeout;
   private probeCache = new Map<string, MediaInfo>();
   private playWindows = new Map<number, { playFirst: number; playLast: number; bufLast: number }>();
+  // Локальные (magnet/.torrent) источники: отрицательные topicId, в приоритете
+  // перед rutracker-фетчерами (для них на rutracker не ходим вовсе).
+  private localSources = new Map<number, LocalSourceSpec>();
 
   constructor(private source: StreamManagerSource) {
     this.client = new WebTorrent({ dht: true, tracker: {} });
@@ -326,6 +336,20 @@ export class StreamManager {
   }
 
   private async resolveTorrentId(topicId: number): Promise<Buffer | string> {
+    const local = this.localSources.get(topicId);
+    if (local) {
+      // Локальная раздача: источник уже задан (magnet или путь к .torrent).
+      if (local.torrentFile) {
+        try {
+          return await fs.promises.readFile(local.torrentFile);
+        } catch {
+          throw new Error('Локальный .torrent недоступен на диске.');
+        }
+      }
+      if (local.magnet) return local.magnet;
+      throw new Error('Локальный источник раздачи не настроен.');
+    }
+
     // .torrent предпочтителен (известен infoHash → быстрый старт + skipVerify), но не
     // ждём его провала, чтобы потом последовательно дёргать magnet: запускаем оба сразу.
     const [torrentRes, magnetRes] = await Promise.allSettled([
@@ -400,8 +424,8 @@ export class StreamManager {
       if (!victim || !victim.torrent) break;
       this.entries.delete(victim.topicId);
       this.playWindows.delete(victim.topicId);
-      log.info(`[stream] evict topic ${victim.topicId} (over limit)`);
-      victim.torrent.destroy({ destroyStore: true }, () => {});
+      log.info(`[stream] evict topic ${victim.topicId} (over limit, store kept)`);
+      victim.torrent.destroy({ destroyStore: false }, () => {});
     }
   }
 
@@ -411,8 +435,8 @@ export class StreamManager {
       if (entry.torrent && now - entry.lastUsed > IDLE_TTL_MS) {
         this.entries.delete(id);
         this.playWindows.delete(id);
-        log.info(`[stream] evict topic ${id} (idle)`);
-        entry.torrent.destroy({ destroyStore: true }, () => {});
+        log.info(`[stream] evict topic ${id} (idle, store kept)`);
+        entry.torrent.destroy({ destroyStore: false }, () => {});
       }
     }
   }
@@ -465,6 +489,28 @@ export class StreamManager {
 
   topicIds(): number[] {
     return [...this.entries.keys()];
+  }
+
+  // Регистрирует локальный источник раздачи (magnet или путь к .torrent на диске).
+  // Для отрицательных topicId resolveTorrentId берёт его в приоритете и не ходит
+  // на rutracker. Пустой spec (без magnet/torrentFile) — удаляет регистрацию.
+  setLocalSource(topicId: number, spec: LocalSourceSpec | null): void {
+    if (!spec || (!spec.magnet && !spec.torrentFile)) {
+      this.localSources.delete(topicId);
+      return;
+    }
+    this.localSources.set(topicId, spec);
+  }
+
+  removeLocalSource(topicId: number): void {
+    this.localSources.delete(topicId);
+  }
+
+  // Имя загруженной раздачи (для magnet — после получения метаданных). null, если
+  // раздача ещё не загружена или имени нет.
+  torrentName(topicId: number): string | null {
+    const t = this.entries.get(topicId)?.torrent;
+    return t && !t.destroyed && t.name ? t.name : null;
   }
 
   // Раздача загружена и не на паузе (что-то качает/готово к чтению). Для watchdog'а:
@@ -623,9 +669,14 @@ export class StreamManager {
     return { torrent, file, stream };
   }
 
-  private markCritical(torrent: Torrent, first: number, last: number): void {
+  private markCritical(
+    torrent: Torrent,
+    first: number,
+    last: number,
+    criticalBytes: number = CRITICAL_WINDOW_BYTES,
+  ): void {
     if (torrent.destroyed) return;
-    const span = Math.max(8, Math.ceil(CRITICAL_WINDOW_BYTES / torrent.pieceLength));
+    const span = Math.max(8, Math.ceil(criticalBytes / torrent.pieceLength));
     try {
       torrent.critical(first, Math.min(first + span, last));
     } catch {
@@ -639,12 +690,13 @@ export class StreamManager {
     start: number,
     end: number,
     priority: number = Priority.SEEK,
+    criticalBytes: number = CRITICAL_WINDOW_BYTES,
   ): Promise<void> {
     const { torrent, file } = await this.getFile(topicId, fileIndex);
     const { first, last } = pieceRange(file.offset, start, end, torrent.pieceLength);
     this.schedulerFor(topicId)?.raise(first, last, priority);
     this.schedulerFor(topicId)?.commit();
-    this.markCritical(torrent, first, last);
+    this.markCritical(torrent, first, last, criticalBytes);
   }
 
   // Приоритетно качает «хвост» файла, где обычно лежит seek-индекс (MKV Cues,
@@ -682,6 +734,7 @@ export class StreamManager {
     start: number,
     end: number,
     timeoutMs = 20_000,
+    criticalBytes: number = CRITICAL_WINDOW_BYTES,
   ): Promise<boolean> {
     const { torrent, file } = await this.getFile(topicId, fileIndex);
     if (torrent.destroyed) return false;
@@ -692,7 +745,7 @@ export class StreamManager {
     const scheduler = this.schedulerFor(topicId);
     scheduler?.raise(first, last, Priority.SEEK);
     scheduler?.commit();
-    this.markCritical(torrent, first, last);
+    this.markCritical(torrent, first, last, criticalBytes);
     const stopTimer = perf.timer('stream.waitForBytes.ms');
     const deadline = Date.now() + timeoutMs;
     const pieces = torrent.pieces;
@@ -909,6 +962,36 @@ export class StreamManager {
       for (const { id } of victims) this.entries.delete(id);
       log.info(`[cache] pruned torrent stores of ${victims.length} other topic(s) (keep ${keepTopicId})`);
     }
+  }
+
+  // Удаляет одну раздачу с диска (destroyStore) и чистит её кеши в памяти +
+  // регистрацию локального источника. Используется при ручном удалении/вытеснении
+  // локальной раздачи из истории (её источник больше не нужен).
+  async destroyTopic(topicId: number): Promise<void> {
+    const entry = this.entries.get(topicId);
+    const t = entry?.torrent;
+    const pending = entry?.pending;
+    this.entries.delete(topicId);
+    this.playWindows.delete(topicId);
+    this.localSources.delete(topicId);
+    for (const key of [...this.probeCache.keys()]) {
+      if (key.startsWith(`${topicId}:`)) this.probeCache.delete(key);
+    }
+    if (pending && !t) {
+      // Метаданные ещё грузятся: когда загрузка завершится, раздача уже удалена —
+      // уничтожаем её, чтобы не оставить «осиротевший» торрент в клиенте.
+      void pending
+        .then((torrent) => {
+          if (torrent && !torrent.destroyed) {
+            torrent.destroy({ destroyStore: true }, () => {});
+          }
+        })
+        .catch(() => {});
+    }
+    if (t && !t.destroyed) {
+      await new Promise<void>((res) => t.destroy({ destroyStore: true }, () => res()));
+    }
+    log.info(`[stream] destroy topic ${topicId} (store removed)`);
   }
 
   async destroy(): Promise<void> {

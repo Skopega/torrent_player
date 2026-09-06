@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts must keep LF: CRLF breaks the #!/bin/sh shebang inside Docker images.
+*.sh text eol=lf

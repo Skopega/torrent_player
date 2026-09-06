@@ -100,7 +100,7 @@ export function LoginDropdown({
     setOpen(false);
   };
 
-  const initial = auth.username ? auth.username[0].toUpperCase() : '?';
+  const initial = auth.username && auth.username.length > 0 ? auth.username[0].toUpperCase() : '?';
 
   return (
     <div className="login" ref={ref}>
