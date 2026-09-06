@@ -22,3 +22,5 @@ panel/*.pdb
 .env
 *.pem
 *.key
+
+kill_processes.bat
