@@ -5,13 +5,6 @@ general
 - watch in realtime while downloading and transcoding
 - nvenc/qsv/x264 hls
 
-
-todo
-- qsv not tested
-- mb do some cache tricks cause rn it just deletes old cached segments after loading a new player
-- mb add pre-download, pre-transcode
-
-
 install
 - run setup.bat
 - u need normal chrome browser installed on your system
