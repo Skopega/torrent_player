@@ -59,7 +59,7 @@ async function main() {
   const url =
     version === 'latest'
       ? `https://github.com/XTLS/Xray-core/releases/latest/download/Xray-${name}.zip`
-      : `https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-${name}.zip`;
+      : `https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-${name}.zip`;
   const bin = path.join(outDir, process.platform === 'win32' ? 'xray.exe' : 'xray');
   if (fs.existsSync(bin)) {
     console.log(`xray уже есть: ${bin}`);

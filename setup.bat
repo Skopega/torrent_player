@@ -40,10 +40,10 @@ if not exist "runtime\xray\xray.exe" (
 
 rem ---- ffmpeg with QSV (for hardware transcode on Intel iGPU) ----
 if not exist "runtime\ffmpeg\ffmpeg.exe" (
-    echo [4/5] Downloading ffmpeg with QSV (~160 MB)...
+    echo [4/5] Downloading ffmpeg with QSV ^(~160 MB^)...
     call node scripts\fetch-ffmpeg.cjs
     if errorlevel 1 ( echo [WARN] ffmpeg download failed. Transcode will fall back to libx264 ^(CPU^). )
-) else ( echo [4/5] ffmpeg (QSV) present. )
+) else ( echo [4/5] ffmpeg ^(QSV^) present. )
 
 echo [5/5] Building...
 call npm run build
