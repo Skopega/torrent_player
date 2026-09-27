@@ -231,13 +231,20 @@ export class BrowserManager {
   }
 
   // Если челлендж не решился за 60с — выходим с понятной ошибкой. Обычно при
-  // нативном UA Cloudflare отрабатывает за ~5-10с без клика.
-  private async waitChallengeClear(page: Page, seconds = 60): Promise<boolean> {
-    for (let t = 0; t <= seconds; t += 5) {
-      if (t > 0) await sleep(5000);
+  // нативном UA Cloudflare отрабатывает за ~5-10с без клика. При отмене (новый
+  // поиск) выходим сразу, чтобы не держать общую очередь браузера.
+  private async waitChallengeClear(
+    page: Page,
+    seconds = 60,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const deadline = Date.now() + seconds * 1000;
+    for (;;) {
+      if (signal?.aborted) throw new Error('Aborted');
       if (!(await this.isChallenged(page))) return true;
+      if (Date.now() >= deadline) return false;
+      await sleep(500);
     }
-    return false;
   }
 
   private async username(page: Page): Promise<string | null> {
@@ -346,32 +353,43 @@ export class BrowserManager {
     return this.serialize(async () => {
       if (signal?.aborted) throw new Error('Aborted');
       const page = await this.page();
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      if (signal?.aborted) throw new Error('Aborted');
-
-      const cleared = await this.waitChallengeClear(page);
-      if (signal?.aborted) throw new Error('Aborted');
-      if (!cleared) {
-        throw new Error('Cloudflare challenge не пройден (таймаут).');
-      }
-
-      if (waitFor) {
-        await page.waitForSelector(waitFor, { timeout: 15000 }).catch(() => {});
+      // Обрыв навигации при отмене: window.stop() заставляет page.goto завершиться,
+      // иначе устаревший поиск держал бы общую очередь браузера до 60 с, и новый
+      // запрос ждал бы его окончания.
+      const onAbort = () => {
+        void page.evaluate('window.stop()').catch(() => {});
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
         if (signal?.aborted) throw new Error('Aborted');
-      }
 
-      for (let attempt = 0; attempt < 4; attempt++) {
+        const cleared = await this.waitChallengeClear(page, 60, signal);
         if (signal?.aborted) throw new Error('Aborted');
-        try {
-          const p = await this.page();
-          return await p.content();
-        } catch (e) {
-          if (signal?.aborted) throw new Error('Aborted');
-          if (attempt === 3) throw e;
-          await sleep(3000);
+        if (!cleared) {
+          throw new Error('Cloudflare challenge не пройден (таймаут).');
         }
+
+        if (waitFor) {
+          await page.waitForSelector(waitFor, { timeout: 15000 }).catch(() => {});
+          if (signal?.aborted) throw new Error('Aborted');
+        }
+
+        for (let attempt = 0; attempt < 4; attempt++) {
+          if (signal?.aborted) throw new Error('Aborted');
+          try {
+            const p = await this.page();
+            return await p.content();
+          } catch (e) {
+            if (signal?.aborted) throw new Error('Aborted');
+            if (attempt === 3) throw e;
+            await sleep(3000);
+          }
+        }
+        throw new Error('unreachable');
+      } finally {
+        signal?.removeEventListener('abort', onAbort);
       }
-      throw new Error('unreachable');
     });
   }
 

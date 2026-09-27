@@ -28,3 +28,14 @@ index 43464e8..a7c3403 100644
          controller = null
        }
        if (this.maybeDestroyCleanup) this.maybeDestroyCleanup()
+diff --git a/node_modules/bittorrent-tracker/lib/client/udp-tracker.js b/node_modules/bittorrent-tracker/lib/client/udp-tracker.js
+--- a/node_modules/bittorrent-tracker/lib/client/udp-tracker.js
++++ b/node_modules/bittorrent-tracker/lib/client/udp-tracker.js
+@@ -93,6 +93,6 @@ class UDPTracker extends Tracker {
+     let transactionId = genTransactionId()
+ 
+-    const proxyOpts = this.client._proxyOpts && clone(this.client._proxyOpts.socksProxy)
++    const proxyOpts = this.client._proxyOpts && this.client._proxyOpts.socksProxy && clone(this.client._proxyOpts.socksProxy)
+     if (proxyOpts) {
+       if (!proxyOpts.proxy) proxyOpts.proxy = {}
+       // UDP requests uses the associate command

@@ -5,18 +5,21 @@ import { DATA_DIR, rmDirRobust } from './store.js';
 import { FFMPEG_PATH as ffmpegPath } from './media.js';
 import { log } from './logger.js';
 import { parseThumbDir, matchesKeep } from './cache-dirs.js';
+import { previewOffMs } from './preview-budget.js';
+import { Priority } from './scheduler.js';
+import { lowerChildPriority } from './proc.js';
 import type { StreamManager } from './stream.js';
 
 // Интервал между превью (секунды). Должен совпадать с константой на клиенте
 // (web/src/components/Player.tsx), по которой time → index превью.
 export const THUMB_INTERVAL_SEC = 10;
-// Превью запускаются параллельно воспроизведению, только если транскод опережает
-// playhead минимум на столько секунд — чтобы не отбирать ресурсы у плейбека.
-export const THUMB_PARALLEL_SEC = 60;
 const THUMB_WIDTH = 160;
 const THUMB_DIR = path.join(DATA_DIR, 'cache', 'thumbnails');
 const STREAM_BASE = `http://127.0.0.1:${Number(process.env.TP_PORT) || 3000}`;
 const PROGRESS_LOG_MS = 15000;
+// Как часто проверяем бюджет превью (пауза при перемотке/буферизации). Чаще лога,
+// чтобы быстро уступать дорогу транскоду.
+const POLICY_CHECK_MS = 3000;
 const RESUME_CHECK_MS = 10000;
 // Жёсткий потолок на один ffmpeg-процесс превью: если он завис (feed не качается,
 // декодер зациклился и т.п.), убиваем — иначе глобальная генерация блокируется вечно.
@@ -35,6 +38,8 @@ export const THUMB_NEAREST_WINDOW_SLOTS = 30;
 const THUMB_SKIP_FIRST_SLOTS = 1;
 
 interface ThumbJob {
+  topicId: number;
+  fileIndex: number;
   proc: ChildProcess | null;
   dir: string;
   startedAt: number;
@@ -44,10 +49,18 @@ interface ThumbJob {
   total: number;
   // Уже сгенерированные слоты (сидится с диска при старте/резюме, обновляется по ходу).
   slots: Set<number>;
+  // Диапазон байт исходника, который сейчас удерживает SEEK-приоритет (для превью).
+  // Обязаем снять при завершении/остановке, иначе он перебивает чтение фида вечно.
+  held: { start: number; end: number } | null;
 }
 
-// Причина приостановки генерации (null — можно генерировать).
-export type PauseReasonFn = (topicId: number, fileIndex: number) => string | null;
+// Бюджет генерации превью: какую долю времени разрешено качать исходник из торрента
+// (0..1). 0 — превью из исходника не качаем (только из уже перекодированных HLS-
+// сегментов). `reason` — для лога. Долю задаёт сервис по скорости подготовки видео.
+export type PreviewPolicyFn = (
+  topicId: number,
+  fileIndex: number,
+) => { fraction: number; reason: string };
 
 // Точный байт (смещение в файле) позиции `sec` по MKV Cues (null — индекс не готов
 // или файл не MKV). Используется, чтобы приоритизировать именно тот диапазон байт,
@@ -88,10 +101,12 @@ export type TranscodeWindowsFn = (
 // до плотного заполнения оставшихся слотов. Ховер показывает «ближайшее
 // существующее превью» в окне ±THUMB_NEAREST_WINDOW_SLOTS.
 //
-// Адаптивность: если транскод HLS для этого файла отстаёт от playhead меньше чем
-// на THUMB_PARALLEL_SEC — генерация ИЗ ИСХОДНИКА приостанавливается (приоритет —
-// отзывчивость перемотки/плавность); извлечение из уже перекодированных сегментов
-// при этом продолжается (локальный декод, не конкурирует с транскодом).
+// Адаптивность: генерация ИЗ ИСХОДНИКА работает по «бюджету» (доля времени,
+// PreviewPolicyFn): на паузе / при хорошей подготовке — чаще, при слабой — реже или
+// совсем не идёт (приоритет — плавность видео). Диапазоны исходника удерживают
+// SEEK-приоритет только на время окна и обязательно отпускают его после — иначе
+// брошенный диапазон перебивает чтение фида транскода. Извлечение из уже
+// перекодированных сегментов идёт всегда (локальный декод, не конкурирует).
 export class ThumbnailManager {
   private jobs = new Map<string, ThumbJob>();
   // Очередь файлов, ждущих свободный генератор (несколько разных файлов за раз).
@@ -103,10 +118,15 @@ export class ThumbnailManager {
   private slotCache = new Map<string, { at: number; slots: number[] }>();
   // Известное общее число слотов на файл (для /thumbnails/meta после завершения).
   private knownTotals = new Map<string, number>();
+  // До какого момента файлу запрещено снова качать исходник (duty-cycle бюджета).
+  private sourceNotBefore = new Map<string, number>();
+  // Слоты, для которых уже сообщили «HLS unavailable» (дедуп лога: иначе каждый
+  // цикл генерации повторяет одну и ту же строку для «дырки», которую не закрыть).
+  private hlsUnavailableLogged = new Set<string>();
 
   constructor(
     private stream: StreamManager,
-    private pauseReason?: PauseReasonFn,
+    private policy?: PreviewPolicyFn,
     private seekByteFor?: SeekByteForFn,
     private transcodeWindows?: TranscodeWindowsFn,
   ) {}
@@ -117,6 +137,70 @@ export class ThumbnailManager {
 
   private dirFor(topicId: number, fileIndex: number): string {
     return path.join(THUMB_DIR, `${topicId}_${fileIndex}`);
+  }
+
+  // Текущий бюджет качания исходника (0 — нельзя, только HLS-сегменты).
+  private policyFor(topicId: number, fileIndex: number): { fraction: number; reason: string } {
+    try {
+      const p = this.policy?.(topicId, fileIndex);
+      if (p && Number.isFinite(p.fraction)) return p;
+    } catch {
+      /* ignore */
+    }
+    return { fraction: 1, reason: '' };
+  }
+
+  // Можно ли сейчас начать качать исходник и сколько ждать окна бюджета.
+  private sourceGate(
+    topicId: number,
+    fileIndex: number,
+  ): { ok: boolean; fraction: number; reason: string; waitMs: number } {
+    const { fraction, reason } = this.policyFor(topicId, fileIndex);
+    if (!(fraction > 0)) return { ok: false, fraction, reason, waitMs: 0 };
+    const waitMs = Math.max(0, (this.sourceNotBefore.get(this.key(topicId, fileIndex)) ?? 0) - Date.now());
+    return { ok: waitMs <= 0, fraction, reason, waitMs };
+  }
+
+  // Ждёт открытия окна бюджета (duty-cycle), не отменяя джоб. false — джоб отменён
+  // или бюджет стал нулевым (тогда выше по стеку он уйдёт в paused-очередь).
+  private async waitBudget(topicId: number, fileIndex: number, job: ThumbJob): Promise<boolean> {
+    for (;;) {
+      if (job.cancelled) return false;
+      const g = this.sourceGate(topicId, fileIndex);
+      if (!(g.fraction > 0)) {
+        log.info(`[thumbs] ${this.key(topicId, fileIndex)} deferred (${g.reason || 'budget 0'})`);
+        job.cancelled = true;
+        return false;
+      }
+      if (g.ok) return true;
+      await this.delay(Math.min(g.waitMs, 1000));
+    }
+  }
+
+  // Закрывает окно бюджета после использования исходника. Чем меньше доля, тем
+  // длиннее пауза до следующего раза (on/off = fraction/(1-fraction)).
+  private closeSourceWindow(topicId: number, fileIndex: number, fraction: number, runMs: number): void {
+    const off = previewOffMs(fraction, runMs);
+    if (!Number.isFinite(off)) return;
+    this.sourceNotBefore.set(this.key(topicId, fileIndex), Date.now() + off);
+  }
+
+  // Снимает PREVIEW-приоритет с удерживаемого диапазона исходника.
+  private releaseHeld(topicId: number, fileIndex: number, job: ThumbJob): void {
+    const held = job.held;
+    if (!held) return;
+    job.held = null;
+    void this.stream
+      .releasePrioritizedRange(topicId, fileIndex, held.start, held.end, [Priority.PREVIEW])
+      .catch(() => {});
+  }
+
+  // Сколько кадров тянуть за один прогон в плотной фазе. При большом бюджете берём
+  // крупнее — меньше запусков ffmpeg и ожиданий байтов, покрытие набирается быстрее.
+  private denseBatch(fraction: number): number {
+    if (fraction >= 0.6) return 24;
+    if (fraction >= 0.3) return 16;
+    return CHUNK_COUNT;
   }
 
   // Идемпотентный запуск генерации (fire-and-forget). Один поток на файл;
@@ -135,16 +219,12 @@ export class ThumbnailManager {
     if (this.jobs.size === 0 && (this.pending.length || this.paused.size)) this.scheduleResume();
   }
 
-  // Пытается запустить файл: если правило параллельности запрещает — кладёт в paused.
+  // Запускает файл. Бюджет источника проверяем не здесь, а перед конкретным чтением
+  // исходника (runJob): иначе при нулевом бюджете мы бы блокировали и бесплатное
+  // извлечение превью из уже перекодированных HLS-сегментов.
   private tryStart(key: string): boolean {
     const [a, b] = key.split(':').map(Number);
     if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
-    const reason = this.pauseReason?.(a, b) ?? null;
-    if (reason) {
-      log.info(`[thumbs] ${key} deferred (${reason})`);
-      this.paused.add(key);
-      return false;
-    }
     this.startJob(a, b);
     return true;
   }
@@ -193,6 +273,8 @@ export class ThumbnailManager {
       /* ignore */
     }
     const job: ThumbJob = {
+      topicId,
+      fileIndex,
       proc: null,
       dir,
       startedAt: Date.now(),
@@ -200,6 +282,7 @@ export class ThumbnailManager {
       cancelled: false,
       total: 0,
       slots: new Set(),
+      held: null,
     };
     this.jobs.set(key, job);
     void this.runJob(topicId, fileIndex, job);
@@ -275,98 +358,131 @@ export class ThumbnailManager {
             this.noteSlots(topicId, fileIndex, [slot]);
             continue;
           }
-          log.info(`[thumbs] ${key} HLS unavailable @${startSec}s, falling back to source`);
+          const missKey = `${key}:${slot}`;
+          if (!this.hlsUnavailableLogged.has(missKey)) {
+            if (this.hlsUnavailableLogged.size > 20000) this.hlsUnavailableLogged.clear();
+            this.hlsUnavailableLogged.add(missKey);
+            log.info(`[thumbs] ${key} HLS unavailable @${startSec}s, falling back to source`);
+          }
           kind = 'sparse';
         }
 
-        // Дальше — исходник: только когда транскод не отстаёт (правило паузы).
-        const reason = this.pauseReason?.(topicId, fileIndex) ?? null;
-        if (reason) {
-          log.info(`[thumbs] ${key} deferred (${reason})`);
+        // Дальше — исходник: только в рамках бюджета (duty-cycle). Пока бюджет
+        // нулевой — не качаем (транскод/закачка важнее), джоб уйдёт в paused.
+        if (!(await this.waitBudget(topicId, fileIndex, job))) {
           job.cancelled = true;
           break;
         }
+        const sourceStartMs = Date.now();
+        try {
+          if (kind === 'sparse') {
+            // Грубый проход: одиночный кадр в конкретный слот.
+            const startSec = slot * THUMB_INTERVAL_SEC;
+            const prep = await this.prepareChunk(
+              topicId,
+              fileIndex,
+              job,
+              startSec,
+              file.length,
+              duration,
+              THUMB_INTERVAL_SEC * 3,
+            );
+            if (job.cancelled) break;
+            if (!prep.ok) {
+              failures++;
+              if (failures >= 3) {
+                log.warn(`[thumbs] ${key} target @${startSec}s: bytes not ready, aborting`);
+                break;
+              }
+              await this.delay(2000);
+              continue;
+            }
+            failures = 0;
+            const outcome = await this.runTarget(topicId, fileIndex, job, slot);
+            if (job.cancelled || outcome === 'paused') break;
+            if (outcome === 'error') {
+              failures++;
+              if (failures >= 3) {
+                log.warn(`[thumbs] ${key} repeated target errors, aborting`);
+                break;
+              }
+              await this.delay(1000);
+              continue;
+            }
+            // Код 0 не гарантирует запись кадра (например, -ss за конец файла) —
+            // не помечаем «дыру» готовой, а завершаем проход.
+            const targetFile = path.join(job.dir, `thumb${String(slot).padStart(6, '0')}.jpg`);
+            if (!fs.existsSync(targetFile)) {
+              log.info(`[thumbs] ${key} no frame written @${startSec}s (end of stream)`);
+              break;
+            }
+            job.slots.add(slot);
+            this.noteSlots(topicId, fileIndex, [slot]);
+          } else {
+            // Плотная фаза / фолбэк без длительности: непрерывный прогон пропущенных
+            // слотов (не затираем уже сделанные из HLS/грубых проходов).
+            const startIndex = slot;
+            const cap = job.total > 0 ? job.total : Number.POSITIVE_INFINITY;
+            const batch = this.denseBatch(this.policyFor(topicId, fileIndex).fraction);
+            let endIndex = startIndex + 1;
+            while (endIndex < cap && endIndex - startIndex < batch && !job.slots.has(endIndex)) {
+              endIndex++;
+            }
+            const startSec = startIndex * THUMB_INTERVAL_SEC;
+            const prep = await this.prepareChunk(
+              topicId,
+              fileIndex,
+              job,
+              startSec,
+              file.length,
+              duration,
+              (endIndex - startIndex) * THUMB_INTERVAL_SEC,
+            );
+            if (job.cancelled) break;
+            if (!prep.ok) {
+              failures++;
+              if (failures >= 3) {
+                log.warn(`[thumbs] ${key} chunk @${startSec}s: bytes not ready, aborting`);
+                break;
+              }
+              await this.delay(2000);
+              continue;
+            }
+            failures = 0;
 
-        if (kind === 'sparse') {
-          // Грубый проход: одиночный кадр в конкретный слот.
-          const startSec = slot * THUMB_INTERVAL_SEC;
-          const ok = await this.prepareChunk(topicId, fileIndex, job, startSec, file.length, duration);
-          if (job.cancelled) break;
-          if (!ok) {
-            failures++;
-            if (failures >= 3) {
-              log.warn(`[thumbs] ${key} target @${startSec}s: bytes not ready, aborting`);
+            const prevCov = this.coverage(topicId, fileIndex);
+            const outcome = await this.runChunk(topicId, fileIndex, job, startSec, startIndex, endIndex);
+            if (job.cancelled || outcome === 'paused') break;
+            if (outcome === 'error') {
+              failures++;
+              if (failures >= 3) {
+                log.warn(`[thumbs] ${key} repeated chunk errors, aborting`);
+                break;
+              }
+              await this.delay(1000);
+              continue;
+            }
+            // ffmpeg может выйти с кодом 0, записав меньше кадров, чем просили
+            // (EOF/обрезанный хвост) — помечаем готовыми только реально созданные файлы.
+            const written = this.slotsOnDiskInRange(job.dir, startIndex, endIndex);
+            for (const s of written) job.slots.add(s);
+            this.noteSlots(topicId, fileIndex, written);
+            const cov = this.coverage(topicId, fileIndex);
+            if (written.length === 0 || cov <= prevCov) {
+              log.info(`[thumbs] ${key} reached end of stream (coverage=${cov})`);
               break;
             }
-            await this.delay(2000);
-            continue;
           }
-          failures = 0;
-          const outcome = await this.runTarget(topicId, fileIndex, job, slot);
-          if (job.cancelled || outcome === 'paused') break;
-          if (outcome === 'error') {
-            failures++;
-            if (failures >= 3) {
-              log.warn(`[thumbs] ${key} repeated target errors, aborting`);
-              break;
-            }
-            await this.delay(1000);
-            continue;
-          }
-          // Код 0 не гарантирует запись кадра (например, -ss за конец файла) —
-          // не помечаем «дыру» готовой, а завершаем проход.
-          const targetFile = path.join(job.dir, `thumb${String(slot).padStart(6, '0')}.jpg`);
-          if (!fs.existsSync(targetFile)) {
-            log.info(`[thumbs] ${key} no frame written @${startSec}s (end of stream)`);
-            break;
-          }
-          job.slots.add(slot);
-          this.noteSlots(topicId, fileIndex, [slot]);
-        } else {
-          // Плотная фаза / фолбэк без длительности: непрерывный прогон пропущенных
-          // слотов (не затираем уже сделанные из HLS/грубых проходов).
-          const startIndex = slot;
-          const cap = job.total > 0 ? job.total : Number.POSITIVE_INFINITY;
-          let endIndex = startIndex + 1;
-          while (endIndex < cap && endIndex - startIndex < CHUNK_COUNT && !job.slots.has(endIndex)) {
-            endIndex++;
-          }
-          const startSec = startIndex * THUMB_INTERVAL_SEC;
-          const ok = await this.prepareChunk(topicId, fileIndex, job, startSec, file.length, duration);
-          if (job.cancelled) break;
-          if (!ok) {
-            failures++;
-            if (failures >= 3) {
-              log.warn(`[thumbs] ${key} chunk @${startSec}s: bytes not ready, aborting`);
-              break;
-            }
-            await this.delay(2000);
-            continue;
-          }
-          failures = 0;
-
-          const prevCov = this.coverage(topicId, fileIndex);
-          const outcome = await this.runChunk(topicId, fileIndex, job, startSec, startIndex, endIndex);
-          if (job.cancelled || outcome === 'paused') break;
-          if (outcome === 'error') {
-            failures++;
-            if (failures >= 3) {
-              log.warn(`[thumbs] ${key} repeated chunk errors, aborting`);
-              break;
-            }
-            await this.delay(1000);
-            continue;
-          }
-          // ffmpeg может выйти с кодом 0, записав меньше кадров, чем просили
-          // (EOF/обрезанный хвост) — помечаем готовыми только реально созданные файлы.
-          const written = this.slotsOnDiskInRange(job.dir, startIndex, endIndex);
-          for (const s of written) job.slots.add(s);
-          this.noteSlots(topicId, fileIndex, written);
-          const cov = this.coverage(topicId, fileIndex);
-          if (written.length === 0 || cov <= prevCov) {
-            log.info(`[thumbs] ${key} reached end of stream (coverage=${cov})`);
-            break;
-          }
+        } finally {
+          // Снимаем SEEK-приоритет и закрываем окно бюджета на ЛЮБОМ выходе
+          // (успех/ошибка/отмена) — иначе диапазон перебивает чтение фида.
+          this.releaseHeld(topicId, fileIndex, job);
+          this.closeSourceWindow(
+            topicId,
+            fileIndex,
+            this.policyFor(topicId, fileIndex).fraction,
+            Date.now() - sourceStartMs,
+          );
         }
       }
 
@@ -434,7 +550,12 @@ export class ThumbnailManager {
           );
           const last = Math.min(N - 1, Math.floor(w.endSec / THUMB_INTERVAL_SEC));
           for (let s = first; s <= last; s++) {
-            if (!job.slots.has(s)) return { slot: s, kind: 'hls', window: w };
+            if (job.slots.has(s)) continue;
+            // Окно покрывает слот по времени, но конкретный сегмент мог ещё не
+            // появиться (transcodedEndSec опережает диск). Не выдаём его как HLS-цель,
+            // иначе runTargetFromHls каждый цикл падает и логирует «HLS unavailable».
+            if (!this.hlsWindowHasSegment(w, s)) continue;
+            return { slot: s, kind: 'hls', window: w };
           }
         }
       }
@@ -457,9 +578,25 @@ export class ThumbnailManager {
     };
   }
 
+  // Есть ли на диске сегмент HLS, покрывающий время слота (init + нужный seg).
+  private hlsWindowHasSegment(w: TranscodeWindow, slot: number): boolean {
+    const rel = slot * THUMB_INTERVAL_SEC - w.startSec;
+    if (!(rel >= 0) || !(w.segSec > 0)) return false;
+    const idx = Math.floor(rel / w.segSec);
+    try {
+      return (
+        fs.existsSync(path.join(w.dir, 'init.mp4')) &&
+        fs.existsSync(path.join(w.dir, `seg${String(idx).padStart(5, '0')}.m4s`))
+      );
+    } catch {
+      return false;
+    }
+  }
+
   // Свежие слоты в кеш «ближайшего» превью, чтобы ховер сразу видел новые кадры.
   private noteSlots(topicId: number, fileIndex: number, slots: number[]): void {
     const key = this.key(topicId, fileIndex);
+    for (const s of slots) this.hlsUnavailableLogged.delete(`${key}:${s}`);
     const entry = this.slotCache.get(key);
     if (!entry || slots.length === 0) return;
     for (const s of slots) {
@@ -473,8 +610,10 @@ export class ThumbnailManager {
 
   // Готовит байты чанка: по точному кластеру (MKV Cues) или оценке frac*size
   // приоритизирует диапазон и коротко ждёт его куски, чтобы ffmpeg не блокировался.
-  // Возвращает false только при ошибке планировщика (не при таймауте ожидания —
-  // тогда ffmpeg просто дочитает куски с backpressure).
+  // `windowSec` — сколько секунд исходника покроет приоритет: для одного кадра хватает
+  // десятка секунд, для чанка на N кадров — весь прогон. Иначе ffmpeg читает хвост
+  // диапазона на низком приоритете и «ползёт».
+  // Диапазон запоминается в job.held — SEEK-приоритет снимается после чанка/отмены.
   private async prepareChunk(
     topicId: number,
     fileIndex: number,
@@ -482,13 +621,18 @@ export class ThumbnailManager {
     startSec: number,
     fileLen: number,
     duration: number,
-  ): Promise<boolean> {
+    windowSec = 20,
+  ): Promise<{ ok: boolean; start: number; end: number }> {
     const key = this.key(topicId, fileIndex);
     const exactByte = this.seekByteFor
       ? await this.seekByteFor(topicId, fileIndex, startSec).catch(() => null)
       : null;
     const marginBack = 4 * 1024 * 1024;
-    const windowForward = 16 * 1024 * 1024;
+    const bytesPerSec = duration > 0 && fileLen > 0 ? fileLen / duration : 0;
+    const windowForward =
+      bytesPerSec > 0
+        ? Math.max(16 * 1024 * 1024, Math.min(256 * 1024 * 1024, Math.floor(bytesPerSec * windowSec)))
+        : 16 * 1024 * 1024;
     let bs: number;
     let be: number;
     if (exactByte != null) {
@@ -501,21 +645,28 @@ export class ThumbnailManager {
       be = Math.min(fileLen - 1, bs + windowForward);
     }
     try {
-      await this.stream.prioritizeRange(topicId, fileIndex, bs, be);
+      // ВАЖНО: превью качают исходник на НИЗКОМ приоритете (PREVIEW), а не SEEK.
+      // Иначе чанк превью конкурирует с точкой перемотки плейбека на равных и
+      // задерживает первый сегмент (наблюдали 30с+ при seek в начало, где превью
+      // как раз тянуло тот же регион).
+      await this.stream.prioritizeRange(topicId, fileIndex, bs, be, Priority.PREVIEW, 8 * 1024 * 1024);
+      job.held = { start: bs, end: be };
       const ready = await this.stream.waitForBytes(
         topicId,
         fileIndex,
         bs,
         Math.min(be, bs + 8 * 1024 * 1024),
         15000,
+        8 * 1024 * 1024,
+        false,
       );
       if (!ready) {
         log.warn(`[thumbs] ${key} waitForBytes @${startSec}s timed out (byte ${bs})`);
       }
-      return true;
+      return { ok: true, start: bs, end: be };
     } catch (e) {
       log.warn(`[thumbs] ${key} prepare @${startSec}s failed: ${e instanceof Error ? e.message : e}`);
-      return false;
+      return { ok: false, start: bs, end: be };
     }
   }
 
@@ -575,6 +726,7 @@ export class ThumbnailManager {
         stdio: ['ignore', 'ignore', 'pipe'],
       }) as ChildProcess;
       job.proc = proc;
+      lowerChildPriority(proc);
 
       let stderr = '';
       proc.stderr?.on('data', (d) => {
@@ -661,6 +813,7 @@ export class ThumbnailManager {
         stdio: ['ignore', 'ignore', 'pipe'],
       }) as ChildProcess;
       job.proc = proc;
+      lowerChildPriority(proc);
 
       let stderr = '';
       proc.stderr?.on('data', (d) => {
@@ -782,16 +935,23 @@ export class ThumbnailManager {
   ): NodeJS.Timeout {
     const key = this.key(topicId, fileIndex);
     const procStart = Date.now();
+    let lastLogAt = 0;
+    // Проверяем бюджет чаще, чем логируем прогресс: при перемотке/буферизации надо
+    // быстро останавливать превью, а не ждать 15с.
     const timer = setInterval(() => {
-      const cov = this.coverage(topicId, fileIndex);
-      const elapsed = ((Date.now() - job.startedAt) / 1000).toFixed(0);
-      log.info(
-        `[thumbs] ${key} progress coverage=${cov}/${job.total > 0 ? job.total : '?'} (${cov * THUMB_INTERVAL_SEC}s) elapsed=${elapsed}s`,
-      );
-      // Правило параллельности: транскод перестал опережать playhead — пауза.
-      const reason = this.pauseReason?.(topicId, fileIndex) ?? null;
-      if (reason) {
-        log.info(`[thumbs] ${key} pausing (${reason})`);
+      const now = Date.now();
+      // Бюджет стал нулевым (транскод/закачка важнее) — пауза.
+      const { fraction, reason } = this.policyFor(topicId, fileIndex);
+      if (now - lastLogAt >= PROGRESS_LOG_MS) {
+        lastLogAt = now;
+        const cov = this.coverage(topicId, fileIndex);
+        const elapsed = ((now - job.startedAt) / 1000).toFixed(0);
+        log.info(
+          `[thumbs] ${key} progress coverage=${cov}/${job.total > 0 ? job.total : '?'} (${cov * THUMB_INTERVAL_SEC}s) elapsed=${elapsed}s`,
+        );
+      }
+      if (!(fraction > 0)) {
+        log.info(`[thumbs] ${key} pausing (${reason || 'budget 0'})`);
         job.cancelled = true;
         clearInterval(timer);
         job.timer = null;
@@ -806,7 +966,7 @@ export class ThumbnailManager {
         job.timer = null;
         try { proc.kill(); } catch { /* ignore */ }
       }
-    }, PROGRESS_LOG_MS);
+    }, POLICY_CHECK_MS);
     timer.unref();
     return timer;
   }
@@ -818,6 +978,7 @@ export class ThumbnailManager {
     const key = this.key(topicId, fileIndex);
     if (job.timer) clearInterval(job.timer);
     job.timer = null;
+    this.releaseHeld(topicId, fileIndex, job);
     const wasActive = this.jobs.has(key);
     if (wasActive) this.jobs.delete(key);
     if (!wasActive) return; // остановлен извне
@@ -904,6 +1065,12 @@ export class ThumbnailManager {
       /* нет каталога */
     }
     return count;
+  }
+
+  // Индексы уже сгенерированных слотов (для клиентского «ближайшего» превью:
+  // при наведении показываем ближайший существующий кадр на всём таймлайне).
+  slots(topicId: number, fileIndex: number): number[] {
+    return this.slotsOnDisk(topicId, fileIndex);
   }
 
   // Общее число слотов файла (null, пока длительность неизвестна). Берётся из
@@ -1015,6 +1182,7 @@ export class ThumbnailManager {
     job.cancelled = true;
     if (job.timer) clearInterval(job.timer);
     job.timer = null;
+    this.releaseHeld(job.topicId, job.fileIndex, job);
     if (job.proc) {
       try {
         job.proc.kill();

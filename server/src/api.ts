@@ -11,6 +11,8 @@ import { perf } from './perf.js';
 import { assertSafeHttpUrl } from './url-safe.js';
 import { sameOriginGuard } from './csrf.js';
 import { THUMB_INTERVAL_SEC, THUMB_NEAREST_WINDOW_SLOTS } from './thumbnails.js';
+import { clampQuality } from './quality.js';
+import { clampGain, clampBitDepth } from './hls.js';
 
 // Кэп на один Direct Play ответ: браузер просит `bytes=0-` (весь файл), но мы
 // отдаём только ограниченный кусок, чтобы WebTorrent не выбирал весь файл сразу.
@@ -27,6 +29,17 @@ function ah(fn: (req: Request, res: Response) => Promise<unknown>): RequestHandl
 export function createApi(services: Services): Router {
   const api = Router();
 
+  // Активный поиск: запуск нового отменяет предыдущий, чтобы не копить очередь
+  // (старый запрос не держит общую очередь браузера).
+  let activeSearch: AbortController | null = null;
+
+  // Троттлинг клиентских логов: при стойле hls.js шлёт десятки ошибок в секунду,
+  // и синхронный вывод в лог сам по себе бьёт по event loop. Пишем не чаще 1/с с
+  // числом подавленных, а тяжёлое обогащение — не чаще 1/5с.
+  let clientLogAt = 0;
+  let clientLogSuppressed = 0;
+  let clientEnrichAt = 0;
+
   // Живость раздачи для серверного watchdog'а: любой запрос браузера к топику
   // обновляет «последнюю активность». Внутренний ffmpeg-feed (?feed=1) — не в счёт,
   // иначе транскод поддерживал бы сам себя и сторож никогда не сработал бы.
@@ -37,15 +50,24 @@ export function createApi(services: Services): Router {
 
   api.post('/client-log', ah(async (req, res) => {
     const b = (req.body ?? {}) as Record<string, unknown>;
-    log.warn(
-      `[client] ${String(b.msg ?? 'error')} :: ${JSON.stringify(b).slice(0, 4000)}`,
-    );
+    const now = Date.now();
+    if (now - clientLogAt >= 1000) {
+      const sup = clientLogSuppressed > 0 ? ` (+${clientLogSuppressed} suppressed)` : '';
+      clientLogAt = now;
+      clientLogSuppressed = 0;
+      log.warn(
+        `[client] ${String(b.msg ?? 'error')} :: ${JSON.stringify(b).slice(0, 4000)}${sup}`,
+      );
+    } else {
+      clientLogSuppressed++;
+    }
 
     // Обогащаем диагностические события (сталл/таймаут/ошибка) состоянием сервера:
     // скорость закачки, пиры, прогресс, битрейт, докуда накодировано — чтобы видеть,
-    // какой этап тормозит.
+    // какой этап тормозит. Не чаще 1/5с, чтобы не долбить status/probe на каждый churn.
     const detail = `${String(b.details ?? '')} ${String(b.event ?? '')} ${String(b.type ?? '')}`;
-    if (/stall|timeout|error|buffer|fatal/i.test(detail)) {
+    if (/stall|timeout|error|buffer|fatal/i.test(detail) && now - clientEnrichAt >= 5000) {
+      clientEnrichAt = now;
       const id = Number(b.topicId);
       const fi = Number(b.fileIndex);
       if (Number.isFinite(id) && Number.isFinite(fi)) {
@@ -68,6 +90,15 @@ export function createApi(services: Services): Router {
 
     res.json({ ok: true });
   }));
+
+  // Диагностические маршруты/логи — только при TP_DIAG=1 (не в обычном запуске).
+  const DIAG = process.env.TP_DIAG === '1';
+  if (DIAG) {
+    api.get('/__diag/exit', (_req, res) => {
+      res.json({ ok: true });
+      setTimeout(() => process.exit(0), 200);
+    });
+  }
 
   // Метрики производительности: сервер пишет сам, клиент шлёт свои (seek/stall).
   api.get('/perf', (_req, res) => {
@@ -135,12 +166,17 @@ export function createApi(services: Services): Router {
       res.json({ results: [] });
       return;
     }
+    // Новый поиск отменяет предыдущий — иначе старый висел бы в очереди браузера
+    // и новый запрос ждал бы его окончания.
+    activeSearch?.abort();
     const ac = new AbortController();
+    activeSearch = ac;
     res.on('close', () => {
       if (!res.writableEnded) ac.abort();
     });
     try {
       const results = await services.search(q, ac.signal);
+      if (activeSearch === ac) activeSearch = null;
       res.json({ results });
     } catch (e) {
       if (ac.signal.aborted) return;
@@ -257,11 +293,17 @@ export function createApi(services: Services): Router {
       resRaw !== undefined && resRaw !== '' && Number.isFinite(Number(resRaw)) && Number(resRaw) > 0
         ? Number(resRaw)
         : null;
+    const qualityVal = clampQuality(req.query.quality);
+    const gainVal = clampGain(req.query.gain);
+    const bdVal = clampBitDepth(req.query.bd);
     const posRaw = req.query.pos;
     const pos =
       posRaw !== undefined && posRaw !== '' && Number.isFinite(Number(posRaw)) && Number(posRaw) > 0
         ? Number(posRaw)
         : null;
+    const pausedRaw = req.query.paused;
+    const paused =
+      pausedRaw === '1' ? true : pausedRaw === '0' ? false : undefined;
     try {
       const hasFile = Number.isFinite(fileIndex as number);
       const status = await services.stream.status(
@@ -269,7 +311,7 @@ export function createApi(services: Services): Router {
         hasFile ? (fileIndex as number) : undefined,
       );
       if (hasFile && pos != null) {
-        services.hls.setPlayhead(id, fileIndex as number, pos);
+        services.hls.setPlayhead(id, fileIndex as number, pos, paused);
       }
       let transcodedSec: number | null = null;
       if (hasFile) {
@@ -279,6 +321,9 @@ export function createApi(services: Services): Router {
           audio,
           startSec,
           resVal,
+          qualityVal,
+          gainVal,
+          bdVal,
         );
       }
       res.json({ ...status, transcodedSec });
@@ -328,12 +373,13 @@ export function createApi(services: Services): Router {
       intervalSec: THUMB_INTERVAL_SEC,
       count: services.thumbnails.coverage(id, fileIndex),
       total: services.thumbnails.total(id, fileIndex),
+      slots: services.thumbnails.slots(id, fileIndex),
     });
   });
 
-  // Отдаёт JPEG-превью. Если точный слот ещё не сгенерирован — редиректит на
-  // ближайшее существующее превью в окне ±THUMB_NEAREST_WINDOW_SLOTS слотов
-  // (иерархическая генерация: грубые проходы покрывают весь таймлайн рано).
+  // Отдаёт JPEG-превью. Если точный слот ещё не сгенерирован — отдаём ближайшее
+  // существующее в окне ±THUMB_NEAREST_WINDOW_SLOTS слотов напрямую (без 302, чтобы
+  // не плодить лишний запрос и не ловить гонку «файл появился между проверками»).
   // Если в окне пусто — 404 (клиент скрывает превью).
   api.get('/topic/:id/stream/:fileIndex/thumbnails/:name', (req, res) => {
     const id = Number(req.params.id);
@@ -342,9 +388,7 @@ export function createApi(services: Services): Router {
       res.status(400).json({ error: 'bad params' });
       return;
     }
-    const name = String(req.params.name);
-    const p = services.thumbnails.thumbPath(id, fileIndex, name);
-    if (p && fs.existsSync(p)) {
+    const serveThumb = (p: string): void => {
       res.setHeader('Content-Type', 'image/jpeg');
       res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
       const rs = fs.createReadStream(p);
@@ -353,6 +397,11 @@ export function createApi(services: Services): Router {
         if (!res.writableEnded) res.destroy();
       });
       rs.pipe(res);
+    };
+    const name = String(req.params.name);
+    const p = services.thumbnails.thumbPath(id, fileIndex, name);
+    if (p && fs.existsSync(p)) {
+      serveThumb(p);
       return;
     }
     const m = /^thumb(\d{6})\.jpg$/.exec(name);
@@ -367,14 +416,20 @@ export function createApi(services: Services): Router {
       index,
       THUMB_NEAREST_WINDOW_SLOTS,
     );
-    if (near == null || near === index) {
+    if (near == null) {
       res.status(404).end();
       return;
     }
-    res.redirect(
-      302,
-      `/api/topic/${id}/stream/${fileIndex}/thumbnails/thumb${String(near).padStart(6, '0')}.jpg`,
+    const nearPath = services.thumbnails.thumbPath(
+      id,
+      fileIndex,
+      `thumb${String(near).padStart(6, '0')}.jpg`,
     );
+    if (nearPath && fs.existsSync(nearPath)) {
+      serveThumb(nearPath);
+      return;
+    }
+    res.status(404).end();
   });
 
   api.get('/topic/:id/stream/:fileIndex/playlist.m3u8', async (req, res) => {
@@ -402,8 +457,18 @@ export function createApi(services: Services): Router {
       resRaw !== undefined && resRaw !== '' && Number.isFinite(resNum) && resNum > 0
         ? resNum
         : null;
+    const qualityVal = clampQuality(req.query.quality);
+    const gainVal = clampGain(req.query.gain);
+    const bdVal = clampBitDepth(req.query.bd);
     try {
-      const session = await services.hls.start(id, fileIndex, { audio, startSec, res: resVal });
+      const session = await services.hls.start(id, fileIndex, {
+        audio,
+        startSec,
+        res: resVal,
+        quality: qualityVal,
+        gain: gainVal,
+        bitDepth: bdVal,
+      });
       // При старте нового HLS-сеанса превью других файлов/топиков больше не нужны —
       // чистим их (аналогично pruneFileCache для Direct Play). Текущий файл сохраняется.
       services.thumbnails.removeCacheExcept(id, fileIndex);
@@ -489,8 +554,20 @@ export function createApi(services: Services): Router {
       return;
     }
     try {
-      const ready = await services.hls.waitForPlaylist(session, 20000);
+      const ready = await services.hls.waitForPlaylist(session, 10000);
       if (!ready) {
+        // Сессия ещё жива (ffmpeg ждёт байты после перемотки в недокачанный регион) —
+        // отдаём валидный пустой live-плейлист вместо 404, чтобы hls.js продолжал
+        // опрашивать, а не падал фатально (manifestLoadError). Если ffmpeg уже
+        // остановлен/упал — 404.
+        if (session.state === 'active' || session.state === 'starting') {
+          res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+          res.setHeader('Cache-Control', 'no-cache');
+          res.send(
+            '#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n',
+          );
+          return;
+        }
         res.status(404).end();
         return;
       }
@@ -529,15 +606,14 @@ export function createApi(services: Services): Router {
       res.status(404).end();
       return;
     }
-    if (!fs.existsSync(p)) {
-      let size = -1;
-      try {
-        size = fs.statSync(p).size;
-      } catch {
-        /* ignore */
-      }
+    // stat асинхронно: синхронный statSync на загруженном диске блокирует event loop
+    // и сам задерживает последующие fs.open (наблюдали open=1.7с, serve=6с).
+    let size = -1;
+    try {
+      size = (await fs.promises.stat(p)).size;
+    } catch {
       log.warn(
-        `[hls-seg] ${id}:${fileIndex} ${seg} 404 nofile state=${session.state} proc=${session.proc ? 'alive' : 'gone'} size=${size}`,
+        `[hls-seg] ${id}:${fileIndex} ${seg} 404 nofile state=${session.state} proc=${session.proc ? 'alive' : 'gone'}`,
       );
       res.status(404).end();
       return;
@@ -551,21 +627,39 @@ export function createApi(services: Services): Router {
     // (reuse-рестарт ждёт ухода читателей) — иначе клиенту прилетает лавина 404.
     services.hls.retainSession(session.sessionId);
     const startedAt = Date.now();
+    let openAt = 0;
+    let firstByteAt = 0;
+    let readEndAt = 0;
+    let bytes = 0;
     let released = false;
-    const onDone = () => {
+    const onDone = (why: string) => {
       if (released) return;
       released = true;
       services.hls.releaseSession(session.sessionId);
       const ms = Date.now() - startedAt;
-      if (ms > 3000) {
-        log.warn(`[hls-seg] ${id}:${fileIndex} ${seg} slow serve ${ms}ms state=${session.state}`);
+      perf.time('hls.seg.serve.ms', ms);
+      services.hls.noteServe(ms);
+      if (ms > 1000) {
+        log.warn(
+          `[hls-seg] ${id}:${fileIndex} ${seg} slow serve ${ms}ms ttfb=${firstByteAt ? firstByteAt - startedAt : -1}ms open=${openAt ? openAt - startedAt : -1}ms readDone=${readEndAt ? readEndAt - startedAt : -1}ms bytes=${bytes}/${size} why=${why} state=${session.state}`,
+        );
       }
     };
-    res.on('finish', onDone);
-    res.on('close', onDone);
+    res.on('finish', () => onDone('finish'));
+    res.on('close', () => onDone('close'));
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-    const rs = fs.createReadStream(p);
+    const rs = fs.createReadStream(p, { highWaterMark: 1 << 20 });
+    rs.on('open', () => {
+      openAt = Date.now();
+    });
+    rs.on('data', (c: string | Buffer) => {
+      if (!firstByteAt) firstByteAt = Date.now();
+      bytes += typeof c === 'string' ? Buffer.byteLength(c) : c.length;
+    });
+    rs.on('end', () => {
+      readEndAt = Date.now();
+    });
     rs.on('error', () => {
       if (!res.writableEnded) res.destroy();
     });
@@ -612,8 +706,38 @@ export function createApi(services: Services): Router {
             : Math.min(range.end, start! + MAX_READ_BYTES)
           : undefined;
 
+      if (isFeed && DIAG) {
+        log.info(
+          `[feed-req] ${id}:${fileIndex} range=${JSON.stringify(req.headers.range ?? 'none')} start=${start ?? 0} end=${end ?? 'EOF'}`,
+        );
+      }
       const opened = await services.stream.openStream(id, fileIndex, { start, end, feed: isFeed });
       stream = opened.stream;
+
+      // ДИАГНОСТИКА (TP_DIAG=1): пропускная способность feed к ffmpeg (байт/с) — чтобы
+      // отличать «транскод голодает по входу» от «медленный кодек».
+      if (isFeed && DIAG) {
+        let feedBytes = 0;
+        let feedLastBytes = 0;
+        let feedLast = Date.now();
+        const feedT0 = Date.now();
+        stream.on('data', (c: string | Buffer) => {
+          feedBytes += typeof c === 'string' ? Buffer.byteLength(c) : c.length;
+        });
+        const feedTimer = setInterval(() => {
+          const now = Date.now();
+          const dt = (now - feedLast) / 1000;
+          const inst = dt > 0 ? (feedBytes - feedLastBytes) / 1048576 / dt : 0;
+          feedLastBytes = feedBytes;
+          feedLast = now;
+          log.info(
+            `[feed] ${id}:${fileIndex} inst=${inst.toFixed(1)}MB/s avg=${(feedBytes / 1048576 / ((now - feedT0) / 1000)).toFixed(1)}MB/s total=${(feedBytes / 1048576).toFixed(0)}MB`,
+          );
+        }, 5000);
+        const stopFeedLog = () => clearInterval(feedTimer);
+        res.on('finish', stopFeedLog);
+        res.on('close', stopFeedLog);
+      }
 
       res.setHeader('Content-Type', contentType);
       res.setHeader('Accept-Ranges', 'bytes');
@@ -759,6 +883,32 @@ export function createApi(services: Services): Router {
       return;
     }
     services.store.setHistoryRes(id, resCeiling);
+    res.json({ ok: true });
+  });
+
+  api.post('/history/:id/quality', (req, res) => {
+    const id = Number(req.params.id);
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const raw = b.qualityLevel == null ? null : Number(b.qualityLevel);
+    const valid = raw == null || (Number.isInteger(raw) && raw >= 0 && raw < 7);
+    if (!Number.isFinite(id) || !valid) {
+      res.status(400).json({ error: 'bad quality' });
+      return;
+    }
+    services.store.setHistoryQuality(id, raw);
+    res.json({ ok: true });
+  });
+
+  api.post('/history/:id/gain', (req, res) => {
+    const id = Number(req.params.id);
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const raw = b.gain == null ? null : Number(b.gain);
+    const valid = raw == null || (Number.isFinite(raw) && raw > 0 && raw <= 4);
+    if (!Number.isFinite(id) || !valid) {
+      res.status(400).json({ error: 'bad gain' });
+      return;
+    }
+    services.store.setHistoryGain(id, raw);
     res.json({ ok: true });
   });
 

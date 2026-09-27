@@ -5,9 +5,19 @@ import { DATA_DIR, rmDirRobust } from './store.js';
 import { FFMPEG_PATH as ffmpegPath } from './media.js';
 import { log } from './logger.js';
 import { perf } from './perf.js';
-import { getEncoder, getEncoderFallback, type EncoderConfig } from './encoder.js';
+import {
+  getEncoder,
+  getEncoderFallback,
+  markEncoderBroken,
+  type EncoderConfig,
+  type EncoderKind,
+  type BitDepth,
+} from './encoder.js';
 import { Priority } from './scheduler.js';
 import { parseHlsDir, matchesKeep } from './cache-dirs.js';
+import { lowerChildPriority } from './proc.js';
+import { clampQuality, qualityLevelOf } from './quality.js';
+import { DownloadLimiter, serveStats } from './download-limiter.js';
 import type { StreamManager } from './stream.js';
 import type { SubtitleManager } from './subs.js';
 import type { MediaInfo } from './types.js';
@@ -20,12 +30,22 @@ const SEGMENT_SECONDS = 2;
 // Лимит суммарного дискового кеша HLS (сегменты не удаляются при seek, поэтому
 // нужен потолок — иначе remux до EOF быстро забьёт диск).
 const HLS_MAX_BYTES = 20 * 1024 * 1024 * 1024;
-// Докачка точки входа перед спавном ffmpeg после перемотки: ждём, пока куски
-// позиции seek реально скачаются (с потолком), чтобы транскод не вис на feed.
-const SEEK_READY_TIMEOUT_MS = 25_000;
+// Докачка точки входа перед спавном ffmpeg после перемотки: коротко ждём, пока
+// куски позиции seek скачаются, чтобы ffmpeg не вис на feed. Держим МЕНЬШЕ
+// клиентского manifestLoadingTimeOut (20с): start() вызывается в запросе плейлиста,
+// и слишком долгое ожидание превращается в manifestLoadTimeOut на клиенте. SEEK-
+// приоритет теперь сохраняется (см. waitForBytes(..., false)), поэтому даже если не
+// успели — ffmpeg дождётся байтов, а не потеряет их.
+const SEEK_READY_TIMEOUT_MS = 12_000;
 // Ширина критического окна при seek: помечаем больший диапазон как critical,
 // чтобы нужные куски доехали первыми (rarest-first их иначе откладывает).
 const SEEK_CRITICAL_BYTES = 32 * 1024 * 1024;
+// Потолок одновременных ffmpeg-транскодов (защита CPU/GPU/диска при частых seek).
+const MAX_CONCURRENT_FFMPEG = 4;
+// Если транскод не выдал ни одного нового сегмента дольше этого времени, а источник
+// впереди доступен — процесс завис: перезапускаем (и при повторе уходим на фолбэк-кодер).
+const STUCK_RESTART_MS = 30_000;
+const STUCK_MAX_RESTARTS = 2;
 
 // Асинхронный подсчёт размера каталога: синхронный обход всего HLS-кеша на каждый
 // start() блокировал event loop (фризы при перемотке на больших кешах).
@@ -61,6 +81,23 @@ export interface HlsStartOptions {
   startSec?: number;
   // Потолок высоты вывода (например 720/1080/2160). null/0 = полный размер исходника.
   res?: number | null;
+  // Уровень качества транскода 0..6 (0 — максимум). null/undefined = DEFAULT_QUALITY.
+  quality?: number | null;
+  // Gain исходника до энкода (1 = выключено). Входит в ключ/каталог сессии.
+  gain?: number | null;
+  // Битность выхода: 8 или 10 (10 => HEVC/AV1). Входит в ключ/каталог сессии.
+  bitDepth?: number | null;
+}
+
+// gain: 0.10..4.00 с округлением до 0.01 (чтобы не плодить варианты кеша сессий).
+export function clampGain(v: unknown): number {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return 1;
+  return Math.round(Math.min(4, Math.max(0.1, n)) * 100) / 100;
+}
+
+export function clampBitDepth(v: unknown): BitDepth {
+  return Number(v) === 10 ? 10 : 8;
 }
 
 interface HlsSession {
@@ -70,6 +107,12 @@ interface HlsSession {
   audio: number | null;
   startSec: number; // абсолютная секунда, округлённая до границы сегмента
   res: number | null;
+  // Уровень качества транскода (0..6, см. quality.ts). Влияет на квантайзер/усилие
+  // энкодера и входит в ключ сессии/каталог (смена качества = новая сессия).
+  quality: number;
+  // Gain исходника и битность выхода — часть ключа/каталога сессии.
+  gain: number;
+  bitDepth: BitDepth;
   dir: string;
   proc: ChildProcess | null;
   state: 'starting' | 'active' | 'finished' | 'error' | 'stopped';
@@ -81,6 +124,15 @@ interface HlsSession {
   transcodedEndSec: number; // абсолютная секунда, до которой уже накодировано
   fileLength: number; // размер файла (для расчёта prefetch-окна по битрейту)
   prefetchedSec: number; // докуда уже поднят prefetch-приоритет исходника
+  // Диапазон байт точки seek, удерживающий SEEK-приоритет (снимаем при остановке,
+  // чтобы старые точки перемотки не конкурировали с новой).
+  seekRange: { start: number; end: number } | null;
+  // Сглаженная скорость транскода (x реального времени) и отношение скорости
+  // закачки к потоку файла — для бюджета превью и диагностики.
+  speedMul: number;
+  feedRatio: number;
+  // Сколько раз сессию перезапускали из-за зависшего ffmpeg (0 сегментов, процесс жив).
+  restarts: number;
 }
 
 interface ProgressTrack {
@@ -103,6 +155,12 @@ export class HlsManager {
   private byId = new Map<string, HlsSession>();
   private activeByFile = new Map<string, string>();
   private playheads = new Map<string, number>();
+  // Когда playhead последний раз двигался и последнее известное состояние паузы.
+  // Нужны бюджету превью, чтобы отличить просмотр от паузы.
+  private playheadAt = new Map<string, number>();
+  private playheadPaused = new Map<string, boolean>();
+  // Предыдущий снимок прогресса для сглаженной скорости транскода.
+  private ratePrev = new Map<string, { sec: number; at: number; ema: number }>();
   // Дедупликация одновременных start() на один ключ: без неё два запроса создали бы
   // две сессии и два ffmpeg, пишущих в один каталог.
   private inFlight = new Map<string, Promise<HlsSession>>();
@@ -116,10 +174,26 @@ export class HlsManager {
   private reusePending = new Map<string, NodeJS.Timeout>();
   // Прогресс транскода на сессию (для детекции «завис» ffmpeg) и prefetch-окно.
   private progress = new Map<string, ProgressTrack>();
+  // Кэш «плейлист готов» на сессию: без него каждый HTTP-запрос плейлиста дёргал
+  // fs.statSync в цикле и на стойле это било по event loop.
+  private playlistReadyCache = new Map<string, { at: number; ready: boolean }>();
   // Последний снимок transcodedEndSec на сессию — для мгновенной (а не накопленной)
   // скорости в snapshot().
   private speedPrev = new Map<string, { sec: number; at: number }>();
   private keepAheadTimer: NodeJS.Timeout;
+  // Адаптивный лимит закачки: контур сам находит устойчивую скорость диска.
+  private limiter = new DownloadLimiter();
+  private limiterTimer: NodeJS.Timeout;
+  // Кольцевой буфер времени отдачи сегментов (сигнал давления на диск).
+  private serveSamples: number[] = [];
+  // Состояние гейта лимита (для телеметрии и логов).
+  private limiterMode: 'uncapped' | 'adaptive' = 'uncapped';
+  private limiterAheadSec = 0;
+  private limiterPlaying = false;
+  // Повторные падения HW-кодера (окно 60с): после двух подряд уходим на libx264.
+  private encoderFailures = new Map<EncoderKind, { count: number; at: number }>();
+  // Защита от наложения тиков лимита (status() асинхронный).
+  private limiterBusy = false;
 
   constructor(
     private stream: StreamManager,
@@ -129,6 +203,38 @@ export class HlsManager {
     // транскода (feed читает последовательно; без этого он встаёт на каждом куске).
     this.keepAheadTimer = setInterval(() => void this.keepAhead(), 4000);
     this.keepAheadTimer.unref();
+    // Тик контура лимита: замеряем нагрузку на диск/event loop и подстраиваем cap.
+    this.limiterTimer = setInterval(() => void this.limiterTick(), 2000);
+    this.limiterTimer.unref();
+  }
+
+  // Время отдачи HLS-сегмента (мс) — основной сигнал давления на диск.
+  noteServe(ms: number): void {
+    if (!Number.isFinite(ms) || ms < 0) return;
+    this.serveSamples.push(ms);
+    if (this.serveSamples.length > 20) this.serveSamples.shift();
+  }
+
+  // Состояние гейта лимита + контура — для телеметрии.
+  limiterTelemetry(): {
+    mode: 'uncapped' | 'adaptive';
+    capBps: number;
+    pressure: boolean;
+    reason: string;
+    baselineMs: number;
+    aheadSec: number;
+    playing: boolean;
+  } {
+    const st = this.limiter.state;
+    return {
+      mode: this.limiterMode,
+      capBps: st.capBps,
+      pressure: st.pressure,
+      reason: st.reason,
+      baselineMs: st.baselineMs,
+      aheadSec: this.limiterAheadSec,
+      playing: this.limiterPlaying,
+    };
   }
 
   retainSession(sessionId: string): void {
@@ -147,8 +253,11 @@ export class HlsManager {
     audio: number | null,
     startSec: number,
     res: number | null,
+    quality: number,
+    gain: number,
+    bitDepth: BitDepth,
   ): string {
-    return `${topicId}:${fileIndex}:${audio ?? ''}:${startSec}:${res ?? ''}`;
+    return `${topicId}:${fileIndex}:${audio ?? ''}:${startSec}:${res ?? ''}:q${quality}:g${gain}:${bitDepth}bit`;
   }
 
   private fileKey(topicId: number, fileIndex: number): string {
@@ -156,7 +265,7 @@ export class HlsManager {
   }
 
   private sessionKey(s: HlsSession): string {
-    return this.key(s.topicId, s.fileIndex, s.audio, s.startSec, s.res);
+    return this.key(s.topicId, s.fileIndex, s.audio, s.startSec, s.res, s.quality, s.gain, s.bitDepth);
   }
 
   // Если сессия — активная для своего файла, убирает её из activeByFile.
@@ -184,6 +293,7 @@ export class HlsManager {
   // Освобождает место в кеше HLS: удаляет самые старые неактивные сессии, пока
   // суммарный размер не опустится под лимит. Активные (текущие) сессии не трогаем.
   private async gcCache(keepDir: string): Promise<void> {
+    const gcT0 = Date.now();
     const entries = [...this.sessions.entries()].map(([key, s]) => ({
       key,
       dir: s.dir,
@@ -192,6 +302,8 @@ export class HlsManager {
     }));
     let total = 0;
     for (const e of entries) total += await dirSizeAsync(e.dir);
+    const gcMs = Date.now() - gcT0;
+    if (gcMs > 200) log.warn(`[cache] gcCache scan took ${gcMs}ms over ${entries.length} session(s)`);
     if (total <= HLS_MAX_BYTES) return;
 
     entries.sort((a, b) => a.startedAt - b.startedAt);
@@ -205,7 +317,10 @@ export class HlsManager {
         /* ignore */
       }
       const s = this.sessions.get(e.key);
-      if (s) this.byId.delete(s.sessionId);
+      if (s) {
+        this.byId.delete(s.sessionId);
+        this.playlistReadyCache.delete(s.sessionId);
+      }
       this.sessions.delete(e.key);
       total -= size;
     }
@@ -214,14 +329,17 @@ export class HlsManager {
   async start(topicId: number, fileIndex: number, opts: HlsStartOptions = {}): Promise<HlsSession> {
     const audio = opts.audio === undefined ? null : opts.audio;
     const res = opts.res && opts.res > 0 ? opts.res : null;
+    const quality = clampQuality(opts.quality);
+    const gain = clampGain(opts.gain);
+    const bitDepth = clampBitDepth(opts.bitDepth);
     const startSec = roundStartSec(opts.startSec ?? 0);
-    const key = this.key(topicId, fileIndex, audio, startSec, res);
+    const key = this.key(topicId, fileIndex, audio, startSec, res, quality, gain, bitDepth);
     const fkey = this.fileKey(topicId, fileIndex);
 
     // Два одновременных start() на один ключ не должны создавать две сессии/ffmpeg.
     const inflight = this.inFlight.get(key);
     if (inflight) return inflight;
-    const p = this.startInternal(topicId, fileIndex, audio, res, startSec, key, fkey);
+    const p = this.startInternal(topicId, fileIndex, audio, res, quality, gain, bitDepth, startSec, key, fkey);
     this.inFlight.set(key, p);
     p.then(
       () => {
@@ -239,6 +357,9 @@ export class HlsManager {
     fileIndex: number,
     audio: number | null,
     res: number | null,
+    quality: number,
+    gain: number,
+    bitDepth: BitDepth,
     startSec: number,
     key: string,
     fkey: string,
@@ -248,6 +369,12 @@ export class HlsManager {
     // Останавливаем ffmpeg остальных сессий этого файла (CPU), но каталоги кеша НЕ удаляем:
     // повторная перемотка в ту же позицию достанет сегменты из кеша мгновенно.
     this.stopOthers(topicId, fileIndex, key);
+    // Ограничиваем число удерживаемых остановленных сессий файла: иначе карты и
+    // каталоги кеша растут с каждой перемоткой, и со временем всё деградирует.
+    this.pruneStaleSessions(topicId, fileIndex, key);
+    // Окно латентности НЕ сбрасываем: медиана устойчива к одиночным замерам, а
+    // непрерывная история позволяет заметить давление сразу после перемотки, не
+    // давая диску захлебнуться на «разгоне» (была петля uncapped→choke→...).
 
     const existing = this.sessions.get(key);
     if (existing && existing.state !== 'error') {
@@ -278,7 +405,10 @@ export class HlsManager {
     const media = await this.stream.probe(topicId, fileIndex);
     const { file } = await this.stream.getFile(topicId, fileIndex);
 
-    const dir = path.join(HLS_DIR, `${topicId}_${fileIndex}_${audio ?? 'def'}_${startSec}_${res ?? 'full'}`);
+    const dir = path.join(
+      HLS_DIR,
+      `${topicId}_${fileIndex}_${audio ?? 'def'}_${startSec}_${res ?? 'full'}_q${quality}_g${gain}_${bitDepth}bit`,
+    );
     this.preparingDirs.add(dir);
     try {
       fs.mkdirSync(dir, { recursive: true });
@@ -296,6 +426,9 @@ export class HlsManager {
       audio,
       startSec,
       res,
+      quality,
+      gain,
+      bitDepth,
       dir,
       proc: null,
       state: 'starting',
@@ -306,6 +439,10 @@ export class HlsManager {
       transcodedEndSec: startSec,
       fileLength: file.length,
       prefetchedSec: startSec,
+      seekRange: null,
+      speedMul: 0,
+      feedRatio: 0,
+      restarts: 0,
     };
     this.sessions.set(key, session);
     this.byId.set(session.sessionId, session);
@@ -334,14 +471,14 @@ export class HlsManager {
         const be = Math.min(file.length - 1, exactByte + windowForward);
         try {
           await this.stream.prioritizeRange(topicId, fileIndex, bs, be, Priority.SEEK, SEEK_CRITICAL_BYTES);
-          await this.stream.waitForBytes(
-            topicId,
-            fileIndex,
-            bs,
-            Math.min(be, bs + 8 * 1024 * 1024),
-            SEEK_READY_TIMEOUT_MS,
-            SEEK_CRITICAL_BYTES,
-          );
+          session.seekRange = { start: bs, end: be };
+          // НЕ ждём докачки точки seek перед спавном ffmpeg: иначе redirect плейлиста
+          // блокируется на несколько секунд (до SEEK_READY_TIMEOUT_MS), и просмотр
+          // стартует медленно. Приоритет уже поднят; ffmpeg сам дождётся байтов через
+          // HTTP-backpressure. Ждём «в фоне» с сохранением SEEK-приоритета.
+          void this.stream
+            .waitForBytes(topicId, fileIndex, bs, Math.min(be, bs + 8 * 1024 * 1024), SEEK_READY_TIMEOUT_MS, SEEK_CRITICAL_BYTES, false)
+            .catch(() => {});
         } catch {
           /* ignore */
         }
@@ -352,14 +489,10 @@ export class HlsManager {
         const byteEnd = Math.min(file.length - 1, byteStart + 8 * 1024 * 1024);
         try {
           await this.stream.prioritizeRange(topicId, fileIndex, byteStart, byteEnd, Priority.SEEK, SEEK_CRITICAL_BYTES);
-          await this.stream.waitForBytes(
-            topicId,
-            fileIndex,
-            byteStart,
-            byteEnd,
-            SEEK_READY_TIMEOUT_MS,
-            SEEK_CRITICAL_BYTES,
-          );
+          session.seekRange = { start: byteStart, end: byteEnd };
+          void this.stream
+            .waitForBytes(topicId, fileIndex, byteStart, byteEnd, SEEK_READY_TIMEOUT_MS, SEEK_CRITICAL_BYTES, false)
+            .catch(() => {});
         } catch {
           /* ignore */
         }
@@ -381,6 +514,9 @@ export class HlsManager {
             tailStart,
             file.length - 1,
             3000,
+            undefined,
+            // Хвост (Cues) тоже нужен активному транскоду — не снимаем SEEK.
+            false,
           );
         }
       } catch {
@@ -392,15 +528,18 @@ export class HlsManager {
     if (startSec > 0 && media.durationSec) {
       const dur = media.durationSec;
       const approx = Math.min(file.length - 1, Math.floor((startSec / dur) * file.length));
+      // Проверяем реальную точку входа (по Cues), а не грубую frac-оценку — иначе
+      // диагностика врёт (approx и precise могут отличаться на сотни МБ).
+      const headByte = session.seekRange ? session.seekRange.start : approx;
       const headReady = await this.stream
-        .areBytesReady(topicId, fileIndex, approx, Math.min(file.length - 1, approx + 2 * 1024 * 1024))
+        .areBytesReady(topicId, fileIndex, headByte, Math.min(file.length - 1, headByte + 2 * 1024 * 1024))
         .catch(() => false);
       const tailStart = Math.max(0, file.length - 4 * 1024 * 1024);
       const tailReady = await this.stream
         .areBytesReady(topicId, fileIndex, tailStart, file.length - 1)
         .catch(() => false);
       log.info(
-        `[hls] diag start=${startSec}s approxByte=${approx} headReady=${headReady} tailReady=${tailReady} readers=${this.readers.get(session.sessionId) ?? 0}`,
+        `[hls] diag start=${startSec}s headByte=${headByte} (approx=${approx}) headReady=${headReady} tailReady=${tailReady} readers=${this.readers.get(session.sessionId) ?? 0}`,
       );
     }
 
@@ -449,6 +588,12 @@ export class HlsManager {
       this.clearSegments(cur.dir);
       cur.transcodedEndSec = cur.startSec;
       cur.prefetchedSec = cur.startSec;
+      // Сбрасываем трек прогресса/скорости и метку старта: иначе остаётся «старый»
+      // pt.at от прошлого прогона, и keepAhead сразу считает процесс зависшим
+      // (ложный recoverStuck → убийство NVENC → падение на медленный libx264).
+      cur.startedAt = Date.now();
+      cur.restarts = 0;
+      this.resetProgress(cur);
       void this.spawn(cur, cur.startSec);
     };
     const t = setTimeout(run, 0);
@@ -461,26 +606,70 @@ export class HlsManager {
   private async keepAhead(): Promise<void> {
     for (const s of this.sessions.values()) {
       if (s.state !== 'active' || !s.proc) continue;
-      const end = s.transcodedEndSec;
+      // Свежий прогресс считаем по сегментам на диске — не зависим от клиентских
+      // опросов статуса (иначе на скрытой вкладке прогресс «замерзал»).
+      const segs = await this.segmentCount(s.dir);
+      if (segs > 0 && s.transcodedEndSec <= s.startSec) {
+        log.info(
+          `[hls] ${s.topicId}:${s.fileIndex} first segment in ${Date.now() - s.startedAt}ms (@${s.startSec}s, ${s.encoder?.label ?? '?'})`,
+        );
+      }
+      const end = Math.max(s.transcodedEndSec, s.startSec + segs * SEGMENT_SECONDS);
+      s.transcodedEndSec = end;
+
+      // Сглаженная скорость транскода (x) и отношение закачки к потоку файла —
+      // метрики для бюджета превью и диагностики.
+      const nowMs = Date.now();
+      const rp = this.ratePrev.get(s.sessionId);
+      if (rp) {
+        const dt = (nowMs - rp.at) / 1000;
+        const inst = dt > 0 ? (end - rp.sec) / dt : 0;
+        s.speedMul = rp.ema > 0 ? rp.ema * 0.5 + inst * 0.5 : inst;
+      }
+      this.ratePrev.set(s.sessionId, { sec: end, at: nowMs, ema: s.speedMul });
+      const durSec = s.media.durationSec ?? 0;
+      if (durSec > 0 && s.fileLength > 0) {
+        try {
+          const st = await this.stream.status(s.topicId, s.fileIndex);
+          const progress = st.file?.progress ?? st.progress;
+          // Файл уже скачан — байты берутся с диска, а не из сети. Если считать
+          // feedRatio от downloadSpeed (≈0), бюджет превью навсегда залипнет на
+          // минимуме. Поэтому полностью локальному файлу даём «бесконечную» подачу.
+          s.feedRatio =
+            progress >= 1 ? 99 : st.downloadSpeed / (s.fileLength / durSec);
+        } catch {
+          /* ignore */
+        }
+      }
+
       const pt = this.progress.get(s.sessionId);
       if (pt) {
         if (end > pt.end) {
           pt.end = end;
           pt.at = Date.now();
           pt.warned = false;
-        } else if (!pt.warned && Date.now() - pt.at > 20000 && end > s.startSec) {
-          pt.warned = true;
-          let files = 0;
-          try {
-            for (const e of fs.readdirSync(s.dir)) {
-              if (/^seg\d{5}\.m4s$/.test(e)) files++;
+          s.restarts = 0;
+        } else {
+          const idle = Date.now() - pt.at;
+          if (!pt.warned && idle > 20000) {
+            // Нет прогресса 20с. Раньше условие требовало end > startSec, из-за чего
+            // «0 сегментов вообще» (главный симптом зависшей перемотки) не логировался.
+            pt.warned = true;
+            let files = 0;
+            try {
+              for (const e of fs.readdirSync(s.dir)) {
+                if (/^seg\d{5}\.m4s$/.test(e)) files++;
+              }
+            } catch {
+              /* ignore */
             }
-          } catch {
-            /* ignore */
+            log.warn(
+              `[hls] ${s.topicId}:${s.fileIndex} transcode stuck at ${end.toFixed(0)}s (${files} segs on disk, proc ${s.proc ? 'alive' : 'gone'})`,
+            );
           }
-          log.warn(
-            `[hls] ${s.topicId}:${s.fileIndex} transcode stuck at ${end.toFixed(0)}s (${files} segs on disk, proc ${s.proc ? 'alive' : 'gone'})`,
-          );
+          // Процесс жив, но вывода нет: если источник впереди доступен, значит
+          // завис кодировщик/декодер — перезапускаем, затем уходим на фолбэк-кодер.
+          if (idle > STUCK_RESTART_MS) this.recoverStuck(s);
         }
       } else {
         this.progress.set(s.sessionId, { end, at: Date.now(), warned: false });
@@ -509,13 +698,192 @@ export class HlsManager {
     for (const id of this.progress.keys()) {
       if (!this.byId.has(id)) this.progress.delete(id);
     }
+    for (const id of this.ratePrev.keys()) {
+      if (!this.byId.has(id)) this.ratePrev.delete(id);
+    }
+  }
+
+  // Восстановление зависшего транскода: процесс ffmpeg жив, но сегменты не пишутся.
+  // Перезапускаем с начала сессии (перезаписываем каталог); если и это не помогло —
+  // уходим на фолбэк-кодер (обычно libx264). Читателей не трогаем (риск 404-шторма).
+  private recoverStuck(s: HlsSession): void {
+    if (s.state !== 'active' || !s.proc) return;
+    if ((this.readers.get(s.sessionId) ?? 0) > 0) return;
+    // Процесс стартовал только что — дать ему время выдать первый сегмент
+    // (на 4K HEVC это может быть несколько секунд). Без этого повторный seek в
+    // точку с существующей сессией ложно «перезапускался» из-за старого pt.at.
+    if (Date.now() - s.startedAt < STUCK_RESTART_MS) return;
+    // Мало данных впереди — это не зависание кодировщика, а недокачка: ждём.
+    if (s.feedRatio > 0 && s.feedRatio < 0.9) return;
+
+    if (s.restarts >= STUCK_MAX_RESTARTS) {
+      log.warn(`[hls] ${s.topicId}:${s.fileIndex} transcode stuck — fallback encoder`);
+      try {
+        s.proc.kill();
+      } catch {
+        /* ignore */
+      }
+      s.proc = null;
+      this.clearSegments(s.dir);
+      s.transcodedEndSec = s.startSec;
+      s.prefetchedSec = s.startSec;
+      s.startedAt = Date.now();
+      this.resetProgress(s);
+      this.retryOrFail(s, 1, 'transcode stuck', 'transcode stuck');
+      return;
+    }
+
+    s.restarts++;
+    log.warn(`[hls] ${s.topicId}:${s.fileIndex} transcode stuck — restart #${s.restarts}`);
+    try {
+      s.proc.kill();
+    } catch {
+      /* ignore */
+    }
+    s.proc = null;
+    this.clearSegments(s.dir);
+    s.transcodedEndSec = s.startSec;
+    s.prefetchedSec = s.startSec;
+    s.startedAt = Date.now();
+    this.resetProgress(s);
+    void this.spawn(s, s.startSec);
+  }
+
+  // Сбрасывает трек прогресса/скорости сессии (после перезапуска/переиспользования).
+  private resetProgress(s: HlsSession): void {
+    const pt = this.progress.get(s.sessionId);
+    if (pt) {
+      pt.end = s.transcodedEndSec;
+      pt.at = Date.now();
+      pt.warned = false;
+    }
+    this.ratePrev.delete(s.sessionId);
+    this.speedPrev.delete(s.sessionId);
+  }
+
+  // Тик лимита закачки. Политика:
+  //   * нет активной сессии → UNCAPPED (кеш набирается на полной);
+  //   * пока сессия активна (включая перемотку/буферизацию/паузу) → адаптивный
+  //     контур по латентности чтения с диска. UNCAPPED достигается сам, когда
+  //     давления нет (здоровый диск); при давлении cap снижается. event loop в
+  //     триггерах НЕ участвует — это кодировщик/CPU.
+  // TP_STREAM_LIMIT_MBPS — жёсткий оверрайд, TP_STREAM_ADAPTIVE=0 — выключить.
+  private async limiterTick(): Promise<void> {
+    if (this.limiterBusy) return;
+    this.limiterBusy = true;
+    try {
+      const forced = Number(process.env.TP_STREAM_LIMIT_MBPS);
+      const forcedOn = Number.isFinite(forced) && forced > 0;
+      const adaptiveOn = process.env.TP_STREAM_ADAPTIVE !== '0';
+
+      const active = [...this.sessions.values()].find(
+        (s) => s.state === 'active' || s.state === 'starting',
+      );
+
+      let playing = false;
+      let ahead = 0;
+      if (active) {
+        const fk = this.fileKey(active.topicId, active.fileIndex);
+        const pos = this.playheads.get(fk);
+        ahead = active.transcodedEndSec - (pos ?? active.startSec);
+        playing = this.isPlaying(active.topicId, active.fileIndex);
+      }
+      this.limiterAheadSec = ahead;
+      this.limiterPlaying = playing;
+
+      // Жёсткий ручной оверрайд имеет приоритет над любым режимом.
+      if (forcedOn) {
+        this.limiter.reset();
+        this.limiterMode = 'uncapped';
+        this.stream.setDownloadRate(forced * 1024 * 1024);
+        return;
+      }
+      if (!active || !adaptiveOn) {
+        this.limiter.reset();
+        this.limiterMode = 'uncapped';
+        this.stream.setDownloadRate(-1);
+        return;
+      }
+
+      // Контур работает ВСЕГДА, пока есть активная сессия (в т.ч. во время перемотки/
+      // буферизации). Иначе получается петля: uncapped душит диск → транскод не
+      // успевает → буфер не растёт → uncapped навсегда. Uncapped достигается сам:
+      // пока давления нет, cap остаётся -1 (здоровый диск); при давлении — снижаем.
+      const stats = serveStats(this.serveSamples);
+
+      let observedBps = 0;
+      let local = false;
+      try {
+        const st = await this.stream.status(active.topicId, active.fileIndex);
+        observedBps = st.downloadSpeed;
+        local = (st.file?.progress ?? st.progress ?? 0) >= 1;
+      } catch {
+        /* ignore */
+      }
+      const durSec = active.media.durationSec ?? 0;
+      const needBps = durSec > 0 && active.fileLength > 0 ? active.fileLength / durSec : 0;
+
+      const state = this.limiter.tick({
+        serveMedMs: stats.med,
+        serveMinMs: stats.min,
+        serveCount: stats.count,
+        observedBps,
+        needBps,
+        local,
+      });
+      this.limiterMode = state.capBps < 0 ? 'uncapped' : 'adaptive';
+      this.stream.setDownloadRate(state.capBps);
+    } finally {
+      this.limiterBusy = false;
+    }
   }
 
   // Позиция плейхеда, сообщённая клиентом через /stream/status?pos= (для правила
   // параллельности превью: генерируем их, только когда транскод опережает ≥ N секунд).
-  setPlayhead(topicId: number, fileIndex: number, pos: number): void {
+  setPlayhead(topicId: number, fileIndex: number, pos: number, paused?: boolean): void {
     if (!Number.isFinite(pos) || pos < 0) return;
-    this.playheads.set(this.fileKey(topicId, fileIndex), pos);
+    const fk = this.fileKey(topicId, fileIndex);
+    const prev = this.playheads.get(fk);
+    // Движение вперёд обновляет метку живости (для режима «играет/пауза»).
+    if (prev == null || pos > prev + 0.5) this.playheadAt.set(fk, Date.now());
+    this.playheads.set(fk, pos);
+    if (paused != null) this.playheadPaused.set(fk, paused);
+  }
+
+  // Играет ли файл прямо сейчас (для бюджета превью). Явное состояние от клиента
+  // в приоритете; иначе — по недавнему движению playhead.
+  private isPlaying(topicId: number, fileIndex: number): boolean {
+    const fk = this.fileKey(topicId, fileIndex);
+    const paused = this.playheadPaused.get(fk);
+    if (paused === true) return false;
+    if (paused === false) return true;
+    // Явного состояния ещё не было: playhead вообще не приходил — считаем, что
+    // играет (консервативно, чтобы не отдать 30% превью на старте). Приходил и замер
+    // дольше 25 с — пауза.
+    if (!this.playheads.has(fk)) return true;
+    const at = this.playheadAt.get(fk) ?? 0;
+    return Date.now() - at < 25_000;
+  }
+
+  // Снимок производительности активной сессии файла: скорость транскода, отношение
+  // закачки к потоку, минимум из них («скорость подготовки»), запас вперёд и
+  // играет ли сейчас. Используется бюджетом превью и для лога.
+  sessionPerf(
+    topicId: number,
+    fileIndex: number,
+  ): { speed: number; feedRatio: number; prep: number; ahead: number; playing: boolean } | null {
+    const s = this.activeSession(topicId, fileIndex);
+    if (!s) return null;
+    const fk = this.fileKey(topicId, fileIndex);
+    const pos = this.playheads.get(fk);
+    const ahead = s.transcodedEndSec - (pos ?? s.startSec);
+    return {
+      speed: s.speedMul,
+      feedRatio: s.feedRatio,
+      prep: Math.min(s.speedMul, s.feedRatio),
+      ahead,
+      playing: this.isPlaying(topicId, fileIndex),
+    };
   }
 
   // Сколько секунд транскод опережает playhead (null — нет активной сессии).
@@ -535,6 +903,9 @@ export class HlsManager {
     // Остановили/удалили сессию до старта (stopSession во время подготовки) —
     // процесс не поднимаем.
     if (session.state === 'stopped' || session.state === 'error') return;
+    // Отсчёт «завис» и треки прогресса/скорости начинаем с момента запуска процесса.
+    session.startedAt = Date.now();
+    this.resetProgress(session);
     const { topicId, fileIndex, audio, gop, res } = session;
     const media = session.media;
     const hasVideo = Boolean(media.videoCodec);
@@ -557,10 +928,27 @@ export class HlsManager {
 
     if (hasVideo) {
       args.push('-map', '0:v:0');
-      // Конвертация формата (10-bit -> 8-bit) и даунскейл — силами кодера.
-      // NVENC держит это на GPU (scale_cuda), остальные — прежний CPU-scale.
-      args.push(...encoder.filterArgs({ height: media.height, res }));
-      args.push(...encoder.videoArgs(gop, SEGMENT_SECONDS));
+      // Масштаб/даунскейл, gain и конвертация битности — по кодеру (NVENC держит
+      // scale на GPU; gain применяется к исходнику в его битности).
+      args.push(
+        ...encoder.filterArgs({
+          height: media.height,
+          res,
+          bitDepth: session.bitDepth,
+          gain: session.gain,
+        }),
+      );
+      const vArgs = encoder.videoArgs({
+        gop,
+        segmentSec: SEGMENT_SECONDS,
+        quality: qualityLevelOf(session.quality),
+        bitDepth: session.bitDepth,
+      });
+      args.push(...vArgs);
+      // Лог эффективных настроек видеокодера.
+      log.info(
+        `[hls] ${topicId}:${fileIndex} quality=${session.quality} gain=${session.gain} bitDepth=${session.bitDepth} ${encoder.label}: ${vArgs.join(' ')}`,
+      );
     }
     if (media.audioCodec) {
       args.push(
@@ -580,15 +968,39 @@ export class HlsManager {
       'playlist.m3u8',
     );
 
+    // Потолок одновременных ffmpeg: лишние (самые старые) транскоды гасим, чтобы
+    // серия перемоток не подняла десяток HW-энкодеров и не задушила CPU/GPU/диск.
+    const live = [...this.sessions.values()].filter((s) => s.proc && s !== session);
+    if (live.length >= MAX_CONCURRENT_FFMPEG) {
+      live.sort((a, b) => a.startedAt - b.startedAt);
+      const toStop = live.length - MAX_CONCURRENT_FFMPEG + 1;
+      for (let i = 0; i < toStop; i++) this.stopSession(live[i]);
+      log.warn(`[hls] ${topicId}:${fileIndex} throttled ffmpeg: stopped ${toStop} older transcode(s)`);
+    }
+
     const proc = spawn(ffmpegPath, args, { cwd: session.dir, stdio: ['ignore', 'ignore', 'pipe'] }) as ChildProcess;
     session.proc = proc;
     session.state = 'active';
+    // ffmpeg/драйвер грузят CPU — держим его ниже Node, чтобы сегменты отдавались вовремя.
+    lowerChildPriority(proc);
 
     let stderr = '';
+    // Троттлинг вывода ffmpeg: декодер HEVC на 4K сыпет сотнями предупреждений в
+    // секунду, а синхронная запись в лог блокирует event loop (наблюдали loopLag ~5с).
+    // Копим и пишем не чаще раза в секунду.
+    let stderrLogAt = 0;
+    let stderrPending = '';
     proc.stderr?.on('data', (d) => {
       const text = d.toString();
       stderr = (stderr + text).slice(-2000);
-      if (text.trim()) log.warn(`[hls] ${topicId}:${fileIndex} ffmpeg: ${text.trim()}`);
+      stderrPending = (stderrPending + text).slice(-2000);
+      const now = Date.now();
+      if (now - stderrLogAt >= 1000) {
+        stderrLogAt = now;
+        const msg = stderrPending.trim();
+        stderrPending = '';
+        if (msg) log.warn(`[hls] ${topicId}:${fileIndex} ffmpeg: ${msg}`);
+      }
     });
     proc.on('error', (err) => {
       session.proc = null;
@@ -623,6 +1035,13 @@ export class HlsManager {
   private retryOrFail(session: HlsSession, code: number, stderr: string, spawnMsg: string | null): void {
     const { topicId, fileIndex } = session;
     const failedKind = session.encoder?.kind ?? 'libx264';
+    // Считаем повторные падения HW-кодера: если он валится снова и снова (напр. на
+    // каждом seek), переключаем авто-выбор на CPU-кодер, чтобы не тратить время/GPU.
+    const now = Date.now();
+    const prev = this.encoderFailures.get(failedKind);
+    const count = prev && now - prev.at < 60_000 ? prev.count + 1 : 1;
+    this.encoderFailures.set(failedKind, { count, at: now });
+    if (failedKind !== 'libx264' && count >= 2) markEncoderBroken(failedKind);
     const fb = getEncoderFallback(failedKind);
     if (fb) {
       session.encoder = fb;
@@ -640,6 +1059,16 @@ export class HlsManager {
   activeSession(topicId: number, fileIndex: number): HlsSession | undefined {
     const key = this.activeByFile.get(this.fileKey(topicId, fileIndex));
     return key ? this.sessions.get(key) : undefined;
+  }
+
+  // Список файлов с живой HLS-сессией (для периодической подстройки бюджета превью).
+  activeFiles(): Array<{ topicId: number; fileIndex: number }> {
+    const out: Array<{ topicId: number; fileIndex: number }> = [];
+    for (const s of this.sessions.values()) {
+      if (s.state === 'stopped') continue;
+      out.push({ topicId: s.topicId, fileIndex: s.fileIndex });
+    }
+    return out;
   }
 
   // Текущий транскодированный диапазон активной сессии файла (для диагностики).
@@ -736,6 +1165,9 @@ export class HlsManager {
   }
 
   private stopSession(s: HlsSession): void {
+    // Уже остановлена и процесс убит — повторный вызов (stopOthers при каждой
+    // перемотке проходит по всем старым сессиям) не должен логировать и работать.
+    if (s.state === 'stopped' && !s.proc) return;
     if (s.proc) {
       try {
         s.proc.kill();
@@ -746,7 +1178,71 @@ export class HlsManager {
     }
     s.state = 'stopped';
     this.unmapIfActive(s);
+    // Снимаем SEEK/BUFFER-приоритеты, которые держала эта сессия: иначе после
+    // перемотки старые точки/окна продолжают качаться и конкурируют с новой
+    // (транскод не получает байты → 0 сегментов → зависший плейбек).
+    this.releaseSessionRanges(s);
+    this.playlistReadyCache.delete(s.sessionId);
     log.info(`[hls] ${s.topicId}:${s.fileIndex} stopped (cache kept)`);
+  }
+
+  // Ограничивает число удерживаемых остановленных сессий файла (кеш для повторных
+  // перемоток). Без этого карты сессий и каталоги HLS растут с каждой перемоткой,
+  // а вместе с ними — работа keepAhead/snapshot и нагрузка на диск. Активные и
+  // читаемые сессии не трогаем.
+  private pruneStaleSessions(topicId: number, fileIndex: number, keepKey: string): void {
+    const RETAIN = 6;
+    const stale: Array<{ key: string; s: HlsSession }> = [];
+    for (const [key, s] of this.sessions) {
+      if (s.topicId !== topicId || s.fileIndex !== fileIndex) continue;
+      if (key === keepKey) continue;
+      if (s.state === 'active' || s.state === 'starting') continue;
+      if ((this.readers.get(s.sessionId) ?? 0) > 0) continue;
+      stale.push({ key, s });
+    }
+    if (stale.length <= RETAIN) return;
+    // Новые — первыми; всё сверх лимита удаляем вместе с каталогом.
+    stale.sort((a, b) => b.s.startedAt - a.s.startedAt);
+    for (const { key, s } of stale.slice(RETAIN)) {
+      this.byId.delete(s.sessionId);
+      this.progress.delete(s.sessionId);
+      this.ratePrev.delete(s.sessionId);
+      this.speedPrev.delete(s.sessionId);
+      this.playlistReadyCache.delete(s.sessionId);
+      this.sessions.delete(key);
+      this.windowsCache.delete(this.fileKey(s.topicId, s.fileIndex));
+      try {
+        rmDirRobust(s.dir);
+      } catch {
+        /* ignore */
+      }
+      log.info(`[cache] pruned stale hls session ${s.dir}`);
+    }
+  }
+
+  // Освобождает приоритеты исходника, поднятые сессией: точку seek (SEEK) и окно
+  // префетча (BUFFER). Вызывается при остановке — чтобы не копить далёкие диапазоны.
+  private releaseSessionRanges(s: HlsSession): void {
+    if (s.seekRange) {
+      void this.stream
+        .releasePrioritizedRange(s.topicId, s.fileIndex, s.seekRange.start, s.seekRange.end, [
+          Priority.SEEK,
+        ])
+        .catch(() => {});
+      s.seekRange = null;
+    }
+    const dur = s.media.durationSec ?? 0;
+    if (dur > 0 && s.fileLength > 0 && s.prefetchedSec > s.startSec) {
+      const toByte = (sec: number): number =>
+        Math.max(0, Math.min(s.fileLength - 1, Math.floor((Math.min(sec, dur) / dur) * s.fileLength)));
+      const b0 = toByte(s.startSec);
+      const b1 = toByte(s.prefetchedSec);
+      if (b1 > b0) {
+        void this.stream
+          .releasePrioritizedRange(s.topicId, s.fileIndex, b0, b1, [Priority.BUFFER])
+          .catch(() => {});
+      }
+    }
   }
 
   // Ждёт фактического завершения процесса (освобождение файловых дескрипторов),
@@ -832,6 +1328,7 @@ export class HlsManager {
       // 'stopped' — close-обработчик ffmpeg завершится раньше (не пересоздаст каталог
       // через retryOrFail после того, как мы его удалили).
       s.state = 'stopped';
+      this.releaseSessionRanges(s);
       doomed.push({ key, fileKey: this.fileKey(s.topicId, s.fileIndex) });
     }
 
@@ -848,6 +1345,7 @@ export class HlsManager {
         /* ignore */
       }
       this.byId.delete(s.sessionId);
+      this.playlistReadyCache.delete(s.sessionId);
       if (this.activeByFile.get(fileKey) === key) this.activeByFile.delete(fileKey);
       this.sessions.delete(key);
       this.windowsCache.delete(fileKey);
@@ -890,15 +1388,25 @@ export class HlsManager {
     return [p, `${p}.tmp`];
   }
 
-  private playlistReady(s: HlsSession): boolean {
+  // Асинхронно (без statSync): синхронный stat в цикле ожидания плейлиста на
+  // каждом запросе бил по event loop при стойле. Результат кэшируем на 250мс.
+  private async playlistReady(s: HlsSession): Promise<boolean> {
+    const cached = this.playlistReadyCache.get(s.sessionId);
+    const now = Date.now();
+    if (cached && now - cached.at < 250) return cached.ready;
+    let ready = false;
     for (const f of this.playlistFiles(s)) {
       try {
-        if (fs.statSync(f).size > 0) return true;
+        if ((await fs.promises.stat(f)).size > 0) {
+          ready = true;
+          break;
+        }
       } catch {
         /* not yet */
       }
     }
-    return false;
+    this.playlistReadyCache.set(s.sessionId, { at: now, ready });
+    return ready;
   }
 
   // Ждёт, пока ffmpeg запишет первый сегмент (плейлист станет непустым).
@@ -909,7 +1417,7 @@ export class HlsManager {
     const stopTimer = perf.timer('hls.firstSegment.ms');
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (this.playlistReady(s)) {
+      if (await this.playlistReady(s)) {
         stopTimer();
         return true;
       }
@@ -980,8 +1488,22 @@ export class HlsManager {
     audio: number | null,
     startSec: number,
     res: number | null,
+    quality: number,
+    gain: number,
+    bitDepth: BitDepth,
   ): Promise<number | null> {
-    const s = this.sessions.get(this.key(topicId, fileIndex, audio, roundStartSec(startSec), res));
+    const s = this.sessions.get(
+      this.key(
+        topicId,
+        fileIndex,
+        audio,
+        roundStartSec(startSec),
+        res,
+        quality,
+        clampGain(gain),
+        clampBitDepth(bitDepth),
+      ),
+    );
     if (!s) return null;
     const count = await this.segmentCount(s.dir);
     const relSec = count * SEGMENT_SECONDS;
@@ -1023,11 +1545,21 @@ export class HlsManager {
     this.activeByFile.clear();
     this.windowsCache.clear();
     clearInterval(this.keepAheadTimer);
+    clearInterval(this.limiterTimer);
+    this.limiter.reset();
+    this.serveSamples = [];
+    this.limiterMode = 'uncapped';
+    this.playlistReadyCache.clear();
+    this.encoderFailures.clear();
     for (const t of this.reusePending.values()) clearTimeout(t);
     this.reusePending.clear();
     this.readers.clear();
     this.progress.clear();
     this.speedPrev.clear();
+    this.ratePrev.clear();
+    this.playheads.clear();
+    this.playheadAt.clear();
+    this.playheadPaused.clear();
     await Promise.all(procs.map((p) => HlsManager.waitExit(p, 2000)));
   }
 }

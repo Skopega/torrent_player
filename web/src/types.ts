@@ -51,6 +51,10 @@ export interface HistoryEntry {
   subtitleTrack?: number | null;
   // Выбранный потолок качества транскода (высота в px), null = полное качество.
   resCeiling?: number | null;
+  // Выбранная ступень качества транскода (0..6), null = по умолчанию.
+  qualityLevel?: number | null;
+  // Gain исходника (1 = выключено) для этой раздачи.
+  gain?: number | null;
 }
 
 export interface HistoryResume {
@@ -61,6 +65,8 @@ export interface HistoryResume {
   audioTrack: number | null;
   subtitleTrack: number | null;
   resCeiling: number | null;
+  qualityLevel: number | null;
+  gain: number | null;
 }
 
 export interface LocalInfo {

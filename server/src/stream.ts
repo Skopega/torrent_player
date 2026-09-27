@@ -2,9 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
+import { randomBytes } from 'node:crypto';
+import bencode from 'bencode';
 import WebTorrent from 'webtorrent';
 import type { Torrent, TorrentFile } from 'webtorrent';
 import parseTorrent from 'parse-torrent';
+import { ProxyAgent } from 'undici';
 import { DATA_DIR } from './store.js';
 import { FFPROBE_PATH as ffprobePath } from './media.js';
 import { log } from './logger.js';
@@ -23,12 +26,26 @@ import type { MediaInfo, StreamFile, StreamStatus } from './types.js';
 
 // Запас в секундах, который качаем вперёд от плейхеда (переводится в байты по битрейту).
 const LOOKAHEAD_SECONDS = 45;
+// Размер окна чтения файла. Читаем диапазон окнами, а не одним createReadStream:
+// иначе webtorrent создаёт stream-selection на весь диапазон (для feed — весь остаток
+// файла, ~11600 кусков), и его piece-picker при sequential-стратегии сканирует тысячи
+// кусков на каждого пира каждый тик → забивает main-поток (профиль: ~32% CPU в
+// trySelectWire), из-за чего feed к ffmpeg падает до ~3МБ/с и транскод голодает.
+const READ_WINDOW_BYTES = 16 * 1024 * 1024;
 // Фолбэк-битрейт, когда длительность/размер не дают оценку (8 Мбит/с).
 const FALLBACK_BITRATE_BPS = 8_000_000;
 
 export interface StreamManagerSource {
   getTorrentBuffer(topicId: number): Promise<Buffer>;
   getMagnet(topicId: number): Promise<string | null>;
+  // URL http-прокси VPN (как у HttpClient/браузера) либо null. Через него гоняем
+  // HTTP-анонсы трекеров: родной трекер rutracker за Cloudflare недоступен напрямую
+  // (fetch failed), и через VPN-выход announce проходит и отдаёт список пиров.
+  getProxyUrl?(): string | null;
+  // GET трекерного анонса через «рабочий» путь (VPN + браузерный UA + Cloudflare).
+  // Возвращает тело ответа (bencode) либо null. Через него добираем пиров, когда
+  // сам webtorrent до трекера не достучался.
+  fetchTracker?(url: string): Promise<Buffer | null>;
 }
 
 // Локальный источник раздачи (magnet/.torrent, без rutracker): либо готовая
@@ -65,6 +82,36 @@ const PROBE_TIMEOUT_MS = 20_000;
 // получали именно нужные куски. Необратимо (webtorrent), поэтому держим небольшим.
 const CRITICAL_WINDOW_BYTES = 8 * 1024 * 1024;
 const TORRENT_DIR = path.join(DATA_DIR, 'cache', 'torrents');
+// Публичные трекеры в дополнение к родному (часто родной недоступен — напр. bt.t-ru.org
+// падает с «fetch failed», и остаётся только DHT, который на малопировых раздачах
+// находит 2-3 пира). Дополнительные трекеры помогают добрать пиров. Можно переопределить
+// через TP_TRACKERS (через запятую).
+const DEFAULT_TRACKERS = [
+  'udp://tracker.opentrackr.org:1337/announce',
+  'udp://open.tracker.cl:1337/announce',
+  'udp://tracker.openbittorrent.com:6969/announce',
+  'udp://exodus.desync.com:6969/announce',
+  'udp://tracker.torrent.eu.org:451/announce',
+  'udp://open.stealth.si:80/announce',
+  'udp://tracker.dler.org:6969/announce',
+  'udp://explodie.org:6969/announce',
+  'https://tracker.tamersunion.org:443/announce',
+];
+const EXTRA_TRACKERS = process.env.TP_TRACKERS
+  ? process.env.TP_TRACKERS.split(',').map((s) => s.trim()).filter(Boolean)
+  : DEFAULT_TRACKERS;
+// Трекерные HTTP-анонсы идут с браузерным User-Agent: Cloudflare (перед bt.t-ru.org)
+// режет пустой/нестандартный UA.
+const TRACKER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
 // Персист DHT-таблицы: одна общая «адресная книга» узлов на все раздачи. Без неё
 // после каждого рестарта DHT стартует с пустой таблицей и набирает узлы через
 // медленный ре-бутстрап (~5-10 минут), из-за чего пиры появляются не сразу.
@@ -91,9 +138,23 @@ export class StreamManager {
   // Локальные (magnet/.torrent) источники: отрицательные topicId, в приоритете
   // перед rutracker-фетчерами (для них на rutracker не ходим вовсе).
   private localSources = new Map<number, LocalSourceSpec>();
+  // Текущий лимит закачки (bytes/s, -1 = без лимита) — чтобы не дёргать throttle зря.
+  private currentLimit = -2;
+  // Агент VPN-прокси для трекерных HTTP-анонсов (переиспользуем на один URL).
+  private trackerAgent: { url: string; agent: ProxyAgent } | null = null;
+  // Свой peer_id (20 байт) для ручных анонсов.
+  private readonly peerId20 = Buffer.concat([Buffer.from('-TP0001-'), randomBytes(12)]);
 
   constructor(private source: StreamManagerSource) {
-    this.client = new WebTorrent({ dht: true, tracker: {} });
+    const torrentPort = Number(process.env.TP_TORRENT_PORT) || undefined;
+    // utp-native (webtorrent's optional uTP transport) is orders of magnitude slower
+    // than TCP (~4 vs ~55 MB/s measured). Default to TCP-only; TP_UTP=1 re-enables uTP.
+    this.client = new WebTorrent({
+      dht: true,
+      tracker: {},
+      utp: process.env.TP_UTP === '1',
+      ...(torrentPort ? { torrentPort } : {}),
+    });
     this.client.on('error', (err) => {
       log.warn(`[stream] client error: ${err instanceof Error ? err.message : String(err)}`);
     });
@@ -219,7 +280,128 @@ export class StreamManager {
       }
     }
 
-    return this.addWithRetry(topicId, torrentId, skipVerify, ihash);
+    this.configureTracker();
+    const torrent = await this.addWithRetry(topicId, torrentId, skipVerify, ihash);
+    // Добираем пиров ручным анонсом (webtorrent до Cloudflare-трекеров не доходит).
+    void this.announceTrackers(torrent);
+    return torrent;
+  }
+
+  // Настраивает трекерный клиент webtorrent перед добавлением торрента: браузерный
+  // User-Agent и (если VPN активен) прокси. Через VPN-выход проходит анонс родного
+  // трекера rutracker (он за Cloudflare — напрямую падал «fetch failed»), и мы
+  // получаем список пиров, а не полагаемся только на DHT.
+  private configureTracker(): void {
+    const proxy = this.source.getProxyUrl?.() ?? null;
+    const opts: Record<string, unknown> = { userAgent: TRACKER_UA };
+    if (proxy) {
+      if (this.trackerAgent && this.trackerAgent.url !== proxy) {
+        // Прокси сменился (VPN переподключился) — старый агент больше не нужен,
+        // закрываем его, чтобы не копить сокеты/дескрипторы.
+        try {
+          void this.trackerAgent.agent.close();
+        } catch {
+          /* ignore */
+        }
+        this.trackerAgent = null;
+      }
+      if (!this.trackerAgent) {
+        try {
+          this.trackerAgent = { url: proxy, agent: new ProxyAgent(proxy) };
+        } catch {
+          this.trackerAgent = null;
+        }
+      }
+      if (this.trackerAgent) {
+        opts.proxyOpts = {
+          httpAgent: this.trackerAgent.agent,
+          httpsAgent: this.trackerAgent.agent,
+        };
+      }
+    }
+    (this.client as unknown as { tracker: unknown }).tracker = opts;
+  }
+
+  // Ручной анонс на HTTP(S)-трекеры через «рабочий» путь (HttpClient с VPN и
+  // браузерным UA). Сам webtorrent до Cloudflare-трекеров не достукивается, а так мы
+  // получаем список пиров и подкидываем их в торрент через addPeer.
+  private async announceTrackers(t: Torrent): Promise<void> {
+    if (typeof this.source.fetchTracker !== 'function') return;
+    const announce = (t as unknown as { announce?: string[] }).announce ?? [];
+    const httpTrackers = announce.filter((u) => /^https?:/i.test(u));
+    if (httpTrackers.length === 0) return;
+    const infoHash = Buffer.from(t.infoHash, 'hex');
+    const port = Number((this.client as unknown as { torrentPort?: number }).torrentPort) || 0;
+    const total = Number((t as unknown as { length?: number }).length) || 0;
+    // left = сколько ещё осталось скачать (трекер по нему считает сидов/личеров).
+    // Если размер ещё неизвестен (магнит без метаданных) — отдаём ненулевой маркер.
+    const left = total > 0 ? Math.max(0, total - (t.downloaded || 0)) : 16384;
+    const pct = (b: Buffer) => [...b].map((x) => '%' + x.toString(16).padStart(2, '0')).join('');
+    for (const base of httpTrackers) {
+      const params =
+        `info_hash=${pct(infoHash)}&peer_id=${pct(this.peerId20)}&port=${port}` +
+        `&uploaded=0&downloaded=0&left=${left}&compact=1&numwant=200&event=started`;
+      const url = base + (base.includes('?') ? '&' : '?') + params;
+      try {
+        const body = await this.source.fetchTracker(url);
+        if (!body) continue;
+        const decoded = bencode.decode(body) as {
+          'failure reason'?: Buffer;
+          peers?: Buffer | Array<Record<string, unknown>>;
+          peers6?: Buffer;
+        };
+        if (decoded['failure reason']) {
+          log.warn(`[stream] tracker ${hostOf(base)}: ${decoded['failure reason'].toString()}`);
+          continue;
+        }
+        const added = this.addCompactPeers(t, decoded.peers, decoded.peers6);
+        log.info(`[stream] tracker ${hostOf(base)} -> ${added} peers`);
+      } catch (e) {
+        log.warn(`[stream] tracker ${hostOf(base)} failed: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+  }
+
+  // Разбирает список пиров из ответа трекера (compact: 6 байт IPv4 / 18 байт IPv6)
+  // и добавляет их в торрент. Возвращает число добавленных.
+  private addCompactPeers(
+    t: Torrent,
+    peers?: Buffer | Array<Record<string, unknown>>,
+    peers6?: Buffer,
+  ): number {
+    let n = 0;
+    const tAdd = t as unknown as { addPeer(addr: string): void };
+    const add = (addr: string): void => {
+      try {
+        tAdd.addPeer(addr);
+        n++;
+      } catch {
+        /* ignore */
+      }
+    };
+    if (Buffer.isBuffer(peers)) {
+      for (let i = 0; i + 6 <= peers.length; i += 6) {
+        add(
+          `${peers[i]}.${peers[i + 1]}.${peers[i + 2]}.${peers[i + 3]}:${(peers[i + 4] << 8) | peers[i + 5]}`,
+        );
+      }
+    } else if (Array.isArray(peers)) {
+      for (const p of peers) {
+        const ip = (p.ip as Buffer | undefined)?.toString?.() ?? '';
+        const port = p.port as number;
+        if (ip && port) add(`${ip}:${port}`);
+      }
+    }
+    if (Buffer.isBuffer(peers6)) {
+      for (let i = 0; i + 18 <= peers6.length; i += 18) {
+        const parts: string[] = [];
+        for (let j = 0; j < 16; j += 2) {
+          parts.push(((peers6[i + j] << 8) | peers6[i + j + 1]).toString(16));
+        }
+        add(`[${parts.join(':')}]:${(peers6[i + 16] << 8) | peers6[i + 17]}`);
+      }
+    }
+    return n;
   }
 
   private findClientTorrent(ihash: string): Torrent | undefined {
@@ -274,6 +456,12 @@ export class StreamManager {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            try {
+              const list = (_t as unknown as { announce?: string[] }).announce ?? [];
+              log.info(`[stream] topic ${topicId} trackers (${list.length}): ${list.join(', ')}`);
+            } catch {
+              /* ignore */
+            }
             resolve(_t);
           });
           torrentRef = torrent;
@@ -286,7 +474,9 @@ export class StreamManager {
         // info_hash», Non-200, сетевые сбои) или просто не даёт пиров. Без этих логов
         // симптом «0 пиров и таймаут метаданных» висит молча.
         torrent.on('warning', (w) => {
-          const msg = typeof w === 'string' ? w : w instanceof Error ? w.message : String(w);
+          const cause = (w as { cause?: { message?: string; code?: string } } | undefined)?.cause;
+          const base = typeof w === 'string' ? w : w instanceof Error ? w.message : String(w);
+          const msg = cause ? `${base} [${cause.code ?? ''} ${cause.message ?? ''}]` : base;
           log.warn(`[stream] topic ${topicId} warning: ${msg}`);
         });
         torrent.on('error', (err) => {
@@ -383,6 +573,7 @@ export class StreamManager {
       path: TORRENT_DIR,
       storeCacheSlots: 40,
       skipVerify,
+      announce: EXTRA_TRACKERS,
     };
   }
 
@@ -397,6 +588,7 @@ export class StreamManager {
   async warm(topicId: number): Promise<void> {
     try {
       const torrent = await this.load(topicId, { quiet: true });
+      void this.announceTrackers(torrent);
       const pieceLen = torrent.pieceLength;
       const n = torrent.pieces.length;
       if (n <= 0 || pieceLen <= 0) return;
@@ -514,11 +706,56 @@ export class StreamManager {
   }
 
   // Раздача загружена и не на паузе (что-то качает/готово к чтению). Для watchdog'а:
-  // останавливать только живую нагрузку и не трогать уже остановленные топики.
+  // останавливать только живую нагрузку и не трогать уже остановленные.
   isBusy(topicId: number): boolean {
     const entry = this.entries.get(topicId);
     const t = entry?.torrent;
     return !!t && !t.destroyed && !t.paused;
+  }
+
+  // Во время активного HLS-просмотра ограничиваем закачку торрента, чтобы он не
+  // забивал HDD и не тормозил отдачу сегментов. `bytesPerSec <= 0` — снять лимит
+  // (например, когда просмотра нет: кеш набирается на полной скорости).
+  setDownloadRate(bytesPerSec: number): void {
+    const rate = bytesPerSec > 0 ? Math.round(bytesPerSec) : -1;
+    if (rate === this.currentLimit) return;
+    this.currentLimit = rate;
+    try {
+      (this.client as unknown as { throttleDownload(rate: number): void }).throttleDownload(rate);
+      log.info(`[stream] download limit -> ${rate < 0 ? 'unlimited' : `${Math.round(rate / 1048576)} MB/s`}`);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // ДИАГНОСТИКА: сколько кусков помечено webtorrent как «критичные» (необратимо) и
+  // сколько активных selections. Помогает ловить деградацию приоритетов после seek.
+  criticalStats(topicId: number): { critical: number; total: number; selections: number } {
+    const t = this.entries.get(topicId)?.torrent as
+      | (Torrent & { _critical?: boolean[]; _selections?: { length: number } })
+      | undefined;
+    if (!t || t.destroyed) return { critical: 0, total: 0, selections: 0 };
+    const c = t._critical;
+    let cnt = 0;
+    if (c) {
+      for (let i = 0; i < c.length; i++) if (c[i]) cnt++;
+    }
+    return { critical: cnt, total: t.pieces.length, selections: t._selections?.length ?? 0 };
+  }
+
+  // Диагностика пиров: сколько соединений, их скорости, кто не отдаёт данные.
+  // Нужна, чтобы понять, почему торрент качается медленно (мало пиров или медленные).
+  wireStats(topicId: number): { wires: number; speeds: number[]; choking: number; noData: number } {
+    const t = this.entries.get(topicId)?.torrent;
+    if (!t || t.destroyed) return { wires: 0, speeds: [], choking: 0, noData: 0 };
+    const wires = (t as unknown as { wires: Array<{ downloadSpeed(): number; peerChoking?: boolean; downloaded?: number }> }).wires ?? [];
+    const speeds = wires
+      .map((w) => Math.round(w.downloadSpeed()))
+      .sort((a, b) => b - a)
+      .slice(0, 8);
+    const choking = wires.filter((w) => w.peerChoking).length;
+    const noData = wires.filter((w) => (w.downloaded ?? 0) === 0).length;
+    return { wires: wires.length, speeds, choking, noData };
   }
 
   stop(topicId: number): void {
@@ -555,6 +792,11 @@ export class StreamManager {
           sched?.externalDeselect(r.first, r.last);
         }
       }
+      // Важно: обнуляем и «желаемые» диапазоны планировщика. Иначе любой следующий
+      // load() (status/probe/warm/… ) делает resume()+commit() и заново выбирает
+      // старые куски — торрент «сам» продолжал качать в фоне после закрытия плеера.
+      sched?.clear();
+      sched?.commit();
     } catch {
       /* ignore */
     }
@@ -662,11 +904,29 @@ export class StreamManager {
       scheduler.commit();
     }
 
-    const stream = file.createReadStream({
-      start: opts.start,
-      end: opts.end,
-    });
+    const len = end - start + 1;
+    const stream =
+      file.length > 0 && len > READ_WINDOW_BYTES
+        ? this.windowedRead(file, start, end)
+        : file.createReadStream({ start: opts.start, end: opts.end });
     return { torrent, file, stream };
+  }
+
+  // Последовательное чтение диапазона окнами по READ_WINDOW_BYTES. Каждое окно —
+  // отдельный createReadStream (свой ограниченный stream-selection в webtorrent),
+  // который закрывается по завершении окна и снимает свой диапазон. Так piece-picker
+  // webtorrent работает с маленькими диапазонами и не сканирует весь остаток файла.
+  private windowedRead(file: TorrentFile, start: number, end: number): Readable {
+    async function* gen(): AsyncGenerator<Buffer> {
+      let pos = start;
+      while (pos <= end) {
+        const winEnd = Math.min(end, pos + READ_WINDOW_BYTES - 1);
+        const rs = file.createReadStream({ start: pos, end: winEnd }) as unknown as AsyncIterable<Buffer>;
+        for await (const chunk of rs) yield chunk;
+        pos = winEnd + 1;
+      }
+    }
+    return Readable.from(gen());
   }
 
   private markCritical(
@@ -697,6 +957,31 @@ export class StreamManager {
     this.schedulerFor(topicId)?.raise(first, last, priority);
     this.schedulerFor(topicId)?.commit();
     this.markCritical(torrent, first, last, criticalBytes);
+  }
+
+  // Снимает поднятый приоритет диапазона (только для кусков, чей текущий приоритет
+  // входит в `priorities`). Нужно, чтобы брошенный/завершённый временный диапазон
+  // (превью, разовая докачка) не перебивал чтение фида транскода/плейбека вечно.
+  async releasePrioritizedRange(
+    topicId: number,
+    fileIndex: number,
+    start: number,
+    end: number,
+    priorities: number[] = [Priority.SEEK],
+  ): Promise<void> {
+    // НЕ дёргаем load()/getFile(): release вызывается в т.ч. из стоп-путей, где
+    // перезагрузка торрента недопустима. Если раздача не загружена — нечего снимать.
+    const torrent = this.entries.get(topicId)?.torrent;
+    if (!torrent || torrent.destroyed) return;
+    const file = torrent.files[fileIndex];
+    if (!file || file.length <= 0) return;
+    const scheduler = this.schedulerFor(topicId);
+    if (!scheduler) return;
+    const clampedEnd = Math.min(end, file.length - 1);
+    if (clampedEnd < start) return;
+    const { first, last } = pieceRange(file.offset, start, clampedEnd, torrent.pieceLength);
+    scheduler.releaseAt(first, last, priorities);
+    scheduler.commit();
   }
 
   // Приоритетно качает «хвост» файла, где обычно лежит seek-индекс (MKV Cues,
@@ -735,6 +1020,7 @@ export class StreamManager {
     end: number,
     timeoutMs = 20_000,
     criticalBytes: number = CRITICAL_WINDOW_BYTES,
+    releaseOnTimeout = true,
   ): Promise<boolean> {
     const { torrent, file } = await this.getFile(topicId, fileIndex);
     if (torrent.destroyed) return false;
@@ -769,7 +1055,14 @@ export class StreamManager {
       }
     }
     stopTimer();
-    return allReceived();
+    const received = allReceived();
+    // Не оставляем «повисший» SEEK: брошенный диапазон иначе навсегда перебивает
+    // чтение фида (копившиеся таймауты превью и были причиной стопора транскода).
+    if (!received && releaseOnTimeout && scheduler && !torrent.destroyed) {
+      scheduler.releaseAt(first, last, [Priority.SEEK]);
+      scheduler.commit();
+    }
+    return received;
   }
 
   // Быстрая проверка, скачаны ли куски диапазона (без ожидания и без выбора).
@@ -886,41 +1179,59 @@ export class StreamManager {
     const cached = this.probeCache.get(key);
     if (cached) return cached;
 
-    const { file } = await this.getFile(topicId, fileIndex);
+    const { torrent, file } = await this.getFile(topicId, fileIndex);
     const ext = extOf(file.name);
     const limit = Math.min(file.length, PROBE_BYTES);
-    const stream = file.createReadStream({ start: 0, end: limit - 1 });
 
+    // Приоритизируем голову и коротко ждём её байты: без этого на слабом сваме
+    // ffprobe не успевает прочитать заголовок за таймаут, длительность теряется —
+    // и на таймлайне не видно полной длины файла.
     try {
-      const stopTimer = perf.timer('stream.probe.ms');
-      const json = await runFfprobe(stream, PROBE_TIMEOUT_MS);
-      stopTimer();
-      const media = mapProbe(json, ext);
-      this.probeCache.set(key, media);
-      return media;
-    } catch (e) {
-      log.warn(`[stream] ffprobe failed for ${file.name}: ${e instanceof Error ? e.message : e}`);
-      return {
-        container: ext || null,
-        videoCodec: null,
-        audioCodec: null,
-        width: null,
-        height: null,
-        durationSec: null,
-        fps: null,
-        bitrate: null,
-        pixFmt: null,
-        canDirectPlay: false,
-        audioTracks: [],
-        subtitleTracks: [],
-      };
-    } finally {
-      try {
-        stream.destroy();
-      } catch {
-        /* ignore */
-      }
+      const sched = this.schedulerFor(topicId);
+      const { first, last } = pieceRange(file.offset, 0, Math.max(0, limit - 1), torrent.pieceLength);
+      sched?.raise(first, last, Priority.SEEK);
+      sched?.commit();
+      await this.waitForBytes(topicId, fileIndex, 0, limit - 1, 12_000, CRITICAL_WINDOW_BYTES, false);
+    } catch {
+      /* ignore */
     }
+
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const stream = file.createReadStream({ start: 0, end: limit - 1 });
+      try {
+        const stopTimer = perf.timer('stream.probe.ms');
+        const json = await runFfprobe(stream, PROBE_TIMEOUT_MS);
+        stopTimer();
+        const media = mapProbe(json, ext);
+        this.probeCache.set(key, media);
+        return media;
+      } catch (e) {
+        lastErr = e;
+      } finally {
+        try {
+          stream.destroy();
+        } catch {
+          /* ignore */
+        }
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    log.warn(`[stream] ffprobe failed for ${file.name}: ${lastErr instanceof Error ? lastErr.message : lastErr}`);
+    return {
+      container: ext || null,
+      videoCodec: null,
+      audioCodec: null,
+      width: null,
+      height: null,
+      durationSec: null,
+      fps: null,
+      bitrate: null,
+      pixFmt: null,
+      canDirectPlay: false,
+      audioTracks: [],
+      subtitleTracks: [],
+    };
   }
 
   // Останавливает и удаляет с диска все раздачи, но оставляет WebTorrent-клиент живым.

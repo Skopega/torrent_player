@@ -7,6 +7,7 @@ import { Services } from './services.js';
 import { createApi } from './api.js';
 import { log } from './logger.js';
 import { sameOriginGuard } from './csrf.js';
+import { raiseSelfPriority } from './proc.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.TP_PORT) || 3000;
@@ -74,6 +75,9 @@ if (fs.existsSync(webDist)) {
 }
 
 async function main() {
+  // Node (HTTP/HLS-отдача) должен быть приоритетнее фонового ffmpeg — иначе на
+  // слабом сервере сегменты отдаются с задержкой и плеер зависает.
+  raiseSelfPriority();
   // При старте чистим кеш: видео-кеши всегда, метаданные — если выросли выше порога.
   try {
     await services.cleanupAtStartup();
@@ -115,3 +119,19 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     void shutdown();
   });
 }
+
+// Сторонние библиотеки (bittorrent-tracker) при уничтожении/переключении торрента
+// роняют непойманный AbortError из внутреннего setTimeout (cleanup → AbortController).
+// Без этих хендлеров падает весь процесс при смене раздачи. Логируем и продолжаем.
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+  log.warn(`[process] unhandled rejection: ${msg}`);
+});
+process.on('uncaughtException', (err) => {
+  if (err?.name === 'AbortError') {
+    log.warn(`[process] ignored AbortError: ${err.message}`);
+    return;
+  }
+  log.error(`[process] uncaught exception: ${err?.stack ?? String(err)}`);
+  void shutdown();
+});

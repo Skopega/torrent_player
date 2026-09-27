@@ -1,4 +1,5 @@
 import { HttpClient, BASE_URL, encodeCp1251 } from './http.js';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -9,7 +10,8 @@ import { BrowserManager } from './browser.js';
 import { StreamManager } from './stream.js';
 import { HlsManager } from './hls.js';
 import { SubtitleManager } from './subs.js';
-import { ThumbnailManager, THUMB_PARALLEL_SEC } from './thumbnails.js';
+import { ThumbnailManager } from './thumbnails.js';
+import { nextPreviewShare, previewShareFor, PREVIEW_SHARE_INIT } from './preview-budget.js';
 import { encoderLabel } from './encoder.js';
 import { parseSearch, parseTopic } from './rutracker.js';
 import { VpnManager } from './vpn/manager.js';
@@ -70,21 +72,37 @@ export class Services {
   readonly stream = new StreamManager({
     getTorrentBuffer: (id) => this.downloadTorrent(id),
     getMagnet: async (id) => (await this.getTopic(id)).magnet,
+    // Трекерные HTTP-анонсы гоняем через тот же VPN-прокси, что и rutracker: родной
+    // трекер за Cloudflare напрямую недоступен, а через VPN отдаёт список пиров.
+    getProxyUrl: () => this.vpn.httpProxyUrl(),
+    fetchTracker: async (url) => {
+      // Трекер пробуем и напрямую (домашний IP часто проходит Cloudflare, а
+      // датацентр-VPN — нет), и через VPN как фолбэк.
+      for (const direct of [true, false]) {
+        try {
+          const r = await this.http.rawRequest(url, undefined, {
+            direct,
+            timeoutMs: 12_000,
+            maxBytes: 4 * 1024 * 1024,
+          });
+          if (r.status >= 200 && r.status < 300) return r.buffer;
+          log.warn(`[stream] tracker ${new URL(url).host} direct=${direct} -> HTTP ${r.status}`);
+        } catch (e) {
+          log.warn(
+            `[stream] tracker ${new URL(url).host} direct=${direct} failed: ${e instanceof Error ? e.message : e}`,
+          );
+        }
+      }
+      return null;
+    },
   });
   readonly subs = new SubtitleManager(this.stream);
   readonly hls = new HlsManager(this.stream, this.subs);
   readonly thumbnails = new ThumbnailManager(
     this.stream,
-    // Превью генерируются параллельно, только когда транскод опережает playhead
-    // минимум на THUMB_PARALLEL_SEC — иначе приоритет у плавности/перемотки.
-    (id, fileIndex) => {
-      const ahead = this.hls.transcodeAheadSec(id, fileIndex);
-      if (ahead == null) return null; // транскода нет (direct play) — можно
-      if (ahead < THUMB_PARALLEL_SEC) {
-        return `transcode ahead ${ahead.toFixed(0)}s < ${THUMB_PARALLEL_SEC}s`;
-      }
-      return null;
-    },
+    // Бюджет генерации превью из исходника: сколько времени можно качать дальние
+    // байты, не мешая подготовке видео. Считается по скорости транскода/закачки.
+    (id, fileIndex) => this.previewPolicy(id, fileIndex),
     // Точный байт для seek по MKV Cues (как в HLS): превью сикают чанками и
     // приоритизируют реальный кластер, а не оценку frac*size.
     (id, fileIndex, sec) => this.subs.seekByteFor(id, fileIndex, sec),
@@ -96,8 +114,17 @@ export class Services {
   private topicCache = this.store.loadTopics();
   private topicTimes = new Map<number, number>();
   private lastCookieSync = 0;
+  // Динамическая доля времени превью из исходника на файл (0..1).
+  private previewShare = new Map<string, number>();
   private monitorTimer: NodeJS.Timeout;
   private watchdogTimer: NodeJS.Timeout;
+  // Лаг event loop: максимальная задержка 1-секундного таймера за окно. Если он
+  // большой — Node чем-то блокируется, и HTTP-ответы (сегменты) опаздывают.
+  private loopLagExpected = 0;
+  private loopLagMax = 0;
+  private loopLagTimer: NodeJS.Timeout;
+  // Точная гистограмма задержек event loop (нс): min/mean/p99/max за окно.
+  private elDelay = monitorEventLoopDelay({ resolution: 10 });
   // Последний момент, когда клиент обращался к раздаче (для watchdog'а).
   private clientSeen = new Map<number, number>();
   // Последний файл, для которого уже сделан per-file prune (дедупликация вызовов
@@ -113,8 +140,26 @@ export class Services {
     this.syncLocalSourcesAtStartup();
     // Периодический снимок производительности в лог: метрики этапов + статус
     // закачки/транскода/превью, чтобы анализировать причины фризов постфактум.
-    this.monitorTimer = setInterval(() => void this.logPerfSnapshot(), 10_000);
+    this.monitorTimer = setInterval(() => {
+      this.updatePreviewBudgets();
+      void this.logPerfSnapshot();
+    }, 10_000);
     this.monitorTimer.unref();
+    // Сэмплер лага event loop: раз в секунду замеряем, насколько опоздал таймер.
+    this.loopLagTimer = setInterval(() => {
+      const now = Date.now();
+      if (this.loopLagExpected) {
+        const lag = Math.max(0, now - this.loopLagExpected - 1000);
+        if (lag > this.loopLagMax) this.loopLagMax = lag;
+        perf.time('loop.lag.ms', lag);
+      }
+      this.loopLagExpected = now;
+    }, 1000);
+    this.loopLagTimer.unref();
+    this.elDelay.enable();
+    log.info(
+      `[perf] UV_THREADPOOL_SIZE=${process.env.UV_THREADPOOL_SIZE ?? 'default(4)'} node=${process.version}`,
+    );
     // Закрыли вкладку/браузер — стоп-сигнал не приходит, поэтому периодически
     // гасим раздачи без свежих клиентских запросов (ffmpeg/превью/закачка).
     this.watchdogTimer = setInterval(() => void this.sweepAbandoned(), WATCHDOG_INTERVAL_MS);
@@ -122,6 +167,37 @@ export class Services {
     // Заранее определяем аппаратный кодер (NVENC/QSV), чтобы первый HLS-старт
     // не задерживался на пробе.
     void encoderLabel().then((label) => log.info(`[hls] hardware encoder: ${label}`));
+  }
+
+  // Бюджет генерации превью из исходника (доля времени, 0..1). Возвращает 1, когда
+  // активного транскода нет (direct play) — там ограничивать нечего.
+  private previewPolicy(id: number, fileIndex: number): { fraction: number; reason: string } {
+    const p = this.hls.sessionPerf(id, fileIndex);
+    if (!p) return { fraction: 1, reason: '' };
+    const stored = this.previewShare.get(`${id}:${fileIndex}`) ?? PREVIEW_SHARE_INIT;
+    const fraction = previewShareFor(stored, p);
+    return {
+      fraction,
+      reason: `prep=${p.prep.toFixed(2)} ahead=${p.ahead.toFixed(0)}s ${p.playing ? 'play' : 'pause'} share=${stored.toFixed(2)}`,
+    };
+  }
+
+  // Раз в 10 с двигаем динамическую долю превью: держим «подготовку плейбека» около
+  // PREVIEW_TARGET_PREP, не давая превью уронить её ниже. Жёсткие случаи (пауза,
+  // малый запас, prep<1.1) контроллер не трогает — см. preview-budget.ts.
+  private updatePreviewBudgets(): void {
+    const live = new Set<string>();
+    for (const { topicId, fileIndex } of this.hls.activeFiles()) {
+      const p = this.hls.sessionPerf(topicId, fileIndex);
+      if (!p) continue;
+      const key = `${topicId}:${fileIndex}`;
+      live.add(key);
+      const prev = this.previewShare.get(key) ?? PREVIEW_SHARE_INIT;
+      this.previewShare.set(key, nextPreviewShare(prev, p));
+    }
+    for (const key of this.previewShare.keys()) {
+      if (!live.has(key)) this.previewShare.delete(key);
+    }
   }
 
   // --- Локальные magnet/.torrent раздачи --------------------------------------
@@ -365,8 +441,10 @@ export class Services {
           const s = await this.stream.status(id);
           const dl = (s.downloadSpeed / 1024).toFixed(0);
           const prog = (s.file?.progress ?? s.progress ?? 0).toFixed(2);
+          const w = this.stream.wireStats(id);
+          const spd = w.speeds.map((b) => (b / 1024).toFixed(0)).join('/');
           topicParts.push(
-            `${id}(dl=${dl}KB/s peers=${s.numPeers} prog=${prog}${s.paused ? ' paused' : ''})`,
+            `${id}(dl=${dl}KB/s peers=${s.numPeers} prog=${prog}${s.paused ? ' paused' : ''} wires=${w.wires} choke=${w.choking} nodata=${w.noData} spd=[${spd}]KB/s)`,
           );
         } catch {
           /* ignore */
@@ -394,6 +472,65 @@ export class Services {
       );
     }
 
+    // Диагностика бюджета превью: «скорость подготовки» = min(транскод, закачка),
+    // запас вперёд, играет/пауза и итоговая доля времени для превью.
+    const prep: string[] = [];
+    for (const h of hls) {
+      const p = this.hls.sessionPerf(h.topicId, h.fileIndex);
+      if (!p) continue;
+      const pol = this.previewPolicy(h.topicId, h.fileIndex);
+      prep.push(
+        `${h.topicId}:${h.fileIndex} prep=${p.prep.toFixed(2)} speed=${p.speed.toFixed(2)} feed=${p.feedRatio.toFixed(2)} ahead=${p.ahead.toFixed(0)}s ${p.playing ? 'play' : 'pause'} thumbs=${(pol.fraction * 100).toFixed(0)}%`,
+      );
+    }
+    if (prep.length) parts.push(`prep=[${prep.join(' ')}]`);
+
+    // Лимит закачки (гейт + контур) и диагноз узкого места: download (не хватает
+    // сети), disk (латентность чтения сегментов), encoder (транскод не успевает),
+    // eventloop (лаг; только диагноз — на cap не влияет).
+    const lim = this.hls.limiterTelemetry();
+    let bottleneck = 'none';
+    if (lim.pressure) {
+      bottleneck = 'disk';
+    } else {
+      for (const h of hls) {
+        const p = this.hls.sessionPerf(h.topicId, h.fileIndex);
+        if (!p) continue;
+        if (p.feedRatio < 1.1) {
+          bottleneck = 'download';
+          break;
+        }
+        if (p.speed < 1) {
+          bottleneck = 'encoder';
+          break;
+        }
+      }
+      if (bottleneck === 'none' && this.loopLagMax > 300) bottleneck = 'eventloop';
+    }
+    const capLabel = lim.capBps < 0 ? 'unlimited' : `${(lim.capBps / 1048576).toFixed(1)}MB/s`;
+    parts.push(
+      `limiter=[mode=${lim.mode} cap=${capLabel} ahead=${lim.aheadSec.toFixed(0)}s ${lim.playing ? 'play' : 'pause'} base=${lim.baselineMs.toFixed(0)}ms pressure=${lim.pressure ? lim.reason : 'no'}] bottleneck=${bottleneck}`,
+    );
+
+    // ДИАГНОСТИКА: точная гистограмма задержек event loop и «критичные» куски.
+    const elMean = this.elDelay.mean / 1e6;
+    const elP99 = this.elDelay.percentile(99) / 1e6;
+    const elMax = this.elDelay.max / 1e6;
+    this.elDelay.reset();
+    parts.push(
+      `elDelay=[mean=${elMean.toFixed(1)} p99=${elP99.toFixed(0)} max=${elMax.toFixed(0)}ms]`,
+    );
+    if (process.env.TP_DIAG === '1') {
+      for (const id of topics) {
+        try {
+          const cs = this.stream.criticalStats(id);
+          parts.push(`critical[${id}]=${cs.critical}/${cs.total} sel=${cs.selections}`);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
     const slowest = Object.entries(metrics)
       .filter(([, m]) => m.count > 0)
       .sort((a, b) => b[1].avgMs - a[1].avgMs)
@@ -406,6 +543,8 @@ export class Services {
 
     const enc = await encoderLabel().catch(() => 'libx264');
     parts.push(`encoder=${enc}`);
+    parts.push(`loopLag=${this.loopLagMax}ms`);
+    this.loopLagMax = 0;
 
     log.info(`[perf] ${parts.join(' ')}`);
   }
@@ -432,14 +571,18 @@ export class Services {
   }
 
   async search(query: string, signal?: AbortSignal): Promise<SearchResult[]> {
+    if (signal?.aborted) throw new Error('Aborted');
     const loggedIn = await this.auth.ensureLoggedIn();
+    if (signal?.aborted) throw new Error('Aborted');
     if (!loggedIn) throw new Error('NOT_LOGGED_IN');
     await this.syncCookies();
+    if (signal?.aborted) throw new Error('Aborted');
 
     // f — разделы, o=10 — сиды, s=2 — по убыванию (сначала лучшие раздачи)
     const url = `${BASE_URL}tracker.php?f=${SEARCH_FORUMS}&nm=${encodeCp1251(query)}&o=10&s=2`;
     log.info(`[services] search "${query}" (sort by seeds, filtered forums)`);
     const html = await this.browser.fetchHtml(url, signal, 'tr.hl-tr');
+    if (signal?.aborted) throw new Error('Aborted');
 
     const results = parseSearch(html);
     for (const r of results) {
@@ -716,6 +859,7 @@ export class Services {
   async close(): Promise<void> {
     clearInterval(this.monitorTimer);
     clearInterval(this.watchdogTimer);
+    clearInterval(this.loopLagTimer);
     await this.hls.stopAll();
     this.subs.stopAll();
     this.thumbnails.stopAll();

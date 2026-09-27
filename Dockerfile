@@ -44,10 +44,32 @@ RUN sed -i 's/Components: main/Components: main non-free/' /etc/apt/sources.list
       tini \
       procps \
       intel-media-va-driver-non-free \
+      libmfx-gen1.2 \
+      libvpl2 \
       libva2 \
       libva-drm2 \
       libva-x11-2 \
       fonts-liberation \
+ && rm -rf /var/lib/apt/lists/*
+
+# BtbN-сборка ffmpeg использует свежий VAAPI-ABI (vaMapBuffer2, libva >= 2.22), а в
+# bookworm libva 2.17 — символа нет, и VAAPI/QSV/oneVPL падают, транскод уходит в
+# libx264. Собираем libva из исходников поверх системной.
+ARG LIBVA_VERSION=2.22.0
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential meson ninja-build pkg-config \
+      libdrm-dev libx11-dev libxext-dev libxfixes-dev libwayland-dev \
+ && curl -fsSL "https://github.com/intel/libva/archive/refs/tags/${LIBVA_VERSION}.tar.gz" -o /tmp/libva.tar.gz \
+ && mkdir -p /tmp/libva && tar -xzf /tmp/libva.tar.gz -C /tmp/libva --strip-components=1 \
+ && cd /tmp/libva \
+ && meson setup build --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu -Ddriverdir=/usr/lib/x86_64-linux-gnu/dri \
+ && ninja -C build && ninja -C build install \
+ && ldconfig \
+ && cd / && rm -rf /tmp/libva /tmp/libva.tar.gz \
+ && apt-get purge -y build-essential meson ninja-build pkg-config \
+      libdrm-dev libx11-dev libxext-dev libxfixes-dev libwayland-dev \
+ && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
 
 # Google Chrome (pre-downloaded .deb). Provides the real Chrome for Cloudflare bypass.
@@ -77,11 +99,15 @@ COPY docker/entrypoint.sh /app/docker/entrypoint.sh
 RUN chmod +x /app/docker/entrypoint.sh
 
 # Explicit paths (xrayBinPath() is DATA_DIR-relative and would break with TP_DATA_DIR=/data).
+# LIBVA_DRIVER_NAME=iHD — используем Intel media driver (iHD), иначе VAAPI/QSV может
+# подхватить устаревший i965 и упасть на iGPU.
 ENV TP_DATA_DIR=/data \
     TP_WEB_DIST=/app/web/dist \
     FFMPEG_PATH=/opt/ffmpeg/ffmpeg \
     FFPROBE_PATH=/opt/ffmpeg/ffprobe \
     XRAY_BIN=/opt/xray/xray \
+    LIBVA_DRIVER_NAME=iHD \
+    UV_THREADPOOL_SIZE=16 \
     RUTRACKER_HEADED=1
 
 RUN mkdir -p /data

@@ -1429,6 +1429,7 @@ button {
   align-items: center;
   gap: 8px;
   margin-left: auto;
+  flex-shrink: 0;
 }
 
 .player-ep-wrap {
@@ -1446,6 +1447,8 @@ button {
   background: rgba(255, 255, 255, 0.12);
   color: #fff;
   font-size: 13px;
+  white-space: nowrap;
+  flex-shrink: 0;
   backdrop-filter: blur(8px);
   cursor: pointer;
   transition: background 0.15s;
@@ -1453,6 +1456,15 @@ button {
 
 .player-ep-btn:hover {
   background: rgba(255, 255, 255, 0.22);
+}
+
+.player-ep-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.player-ep-btn:disabled:hover {
+  background: transparent;
 }
 
 .player-ep-text-mobile {
@@ -1472,6 +1484,59 @@ button {
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   box-shadow: var(--shadow);
+}
+
+.player-menu-gain {
+  min-width: 220px;
+}
+
+/* Единое меню «Качество»: три столбика — битность, разрешение, ступень QP. */
+.player-quality-menu {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+  max-width: min(92vw, 560px);
+}
+
+.player-quality-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 92px;
+}
+
+.player-quality-title {
+  padding: 4px 10px 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.player-gain-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 10px 8px;
+  font-size: 12px;
+  color: var(--text);
+  opacity: 0.9;
+}
+
+.player-gain-val {
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+
+.player-gain-range {
+  display: block;
+  width: 100%;
+  margin: 0 0 6px;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 .player-menu-item {
@@ -1956,6 +2021,14 @@ button {
   .player-menu-episodes {
     left: 0;
     right: auto;
+  }
+  /* На узком экране столбики меню «Качество» ставим друг под друга. */
+  .player-quality-menu {
+    flex-direction: column;
+    gap: 6px;
+  }
+  .player-quality-col {
+    min-width: 150px;
   }
   /* На телефоне только спинер, без текста и без затемнения фона. */
   .player-buffering {

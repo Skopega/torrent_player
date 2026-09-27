@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import {
   api,
@@ -7,6 +7,7 @@ import {
   subtitleUrl,
   thumbnailUrl,
   THUMB_INTERVAL_SEC,
+  THUMB_NEAREST_WINDOW_SLOTS,
 } from '../api';
 import type { MediaInfo, StreamFile, StreamStatus, TrackInfo } from '../types';
 
@@ -19,6 +20,21 @@ const SUB_POLL_MS = 2000;
 const HLS_SEGMENT_SECONDS = 2;
 const roundStart = (t: number) => Math.max(0, Math.floor(t / HLS_SEGMENT_SECONDS) * HLS_SEGMENT_SECONDS);
 
+// Gain (яркость в стиле DaVinci «gain»): умножает исходник ДО энкода на сервере
+// (per-title). Пока тянем ползунок — мгновенный клиентский превью (CSS brightness),
+// на отпускании — commit: новая HLS-сессия с запечённым gain.
+const GAIN_MIN = 0.25;
+const GAIN_MAX = 2.5;
+const GAIN_DEFAULT = 1;
+// Глобальный выбор битности выхода (8/10). 10 => HEVC (без откатов).
+const BD_STORAGE_KEY = 'tp:bitdepth';
+
+// Не начинаем воспроизведение, пока сервер не натранскодировал вперёд хотя бы столько
+// секунд (после перемотки/старта). Предохранитель по времени — чтобы не залипнуть,
+// если транскод не успевает (тогда играем как есть).
+const PLAY_BUFFER_AHEAD_SEC = 10;
+const PLAY_GATE_TIMEOUT_MS = 25000;
+
 // Сохранение прогресса «продолжить с последней серии»: позиция пишется, только
 // когда реально просмотрено не с 0:00, и не чаще интервала/дельты.
 const RESUME_MIN_SEC = 3;
@@ -27,6 +43,18 @@ const RESUME_SAVE_DELTA_SEC = 5;
 
 // Доступные потолки разрешения транскода (по убыванию).
 const RES_OPTIONS = [2160, 1440, 1080, 720, 480, 360];
+
+// Ступени качества транскода (0 — максимум). Должны совпадать с server/src/quality.ts.
+const QUALITY_OPTIONS = [
+  'Max · QP 12',
+  'Very high · QP 16',
+  'High · QP 18',
+  'Raised · QP 20',
+  'Standard · QP 23',
+  'Economy · QP 27',
+  'Minimum · QP 31',
+] as const;
+const DEFAULT_QUALITY = 4;
 
 // Метка потолка для меню качества.
 const resLabel = (r: number): string => {
@@ -164,13 +192,22 @@ export function Player({
   const lastClickRef = useRef(0);
   const resumeRealRef = useRef<number | null>(null);
   const autoPlayRef = useRef(false);
+  // Гейт старта: не играем, пока не наберётся PLAY_BUFFER_AHEAD_SEC секунд
+  // натранскодированного кеша впереди. pending=true — ждём; далее срабатывает
+  // watcher на обновлении transcodedSec (или предохранитель по времени).
+  const transcodedSecRef = useRef<number | null>(null);
+  const playPendingRef = useRef(false);
+  const playGateDeadlineRef = useRef(0);
   const seekStartRef = useRef<number | null>(null);
   const stallStartRef = useRef<number | null>(null);
-  const statusOptsRef = useRef<{ audio: number | null; start: number; pos: number; res: number | null }>({
+  const statusOptsRef = useRef<{ audio: number | null; start: number; pos: number; res: number | null; quality: number; bd: number; paused: boolean }>({
     audio: null,
     start: 0,
     pos: 0,
     res: null,
+    quality: DEFAULT_QUALITY,
+    bd: 8,
+    paused: false,
   });
   // Счётчик попыток recovery текущей HLS-сессии (сбрасывается при новой сессии).
   const hlsRetriesRef = useRef(0);
@@ -188,10 +225,12 @@ export function Player({
   const pendingPrefsRef = useRef<{ volume: number; muted: boolean } | null>(null);
   // Выбранные в истории дорожки (озвучка/субтитры): применяются к каждому файлу
   // (серии) при probe; обновляются при выборе в меню и сохраняются на сервер.
-  const avPrefsRef = useRef<{ audioTrack: number | null; subtitleTrack: number | null; resCeiling: number | null }>({
+  const avPrefsRef = useRef<{ audioTrack: number | null; subtitleTrack: number | null; resCeiling: number | null; qualityLevel: number | null; gain: number | null }>({
     audioTrack: null,
     subtitleTrack: null,
     resCeiling: null,
+    qualityLevel: null,
+    gain: null,
   });
   // Последний сохранённый прогресс (для дедупликации записей на интервале).
   const lastSavedResumeRef = useRef<{ fileIndex: number; position: number } | null>(null);
@@ -219,30 +258,53 @@ export function Player({
   const [menuOpen, setMenuOpen] = useState(false);
   const [audioMenuOpen, setAudioMenuOpen] = useState(false);
   const [subMenuOpen, setSubMenuOpen] = useState(false);
+  const [gainMenuOpen, setGainMenuOpen] = useState(false);
+  const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(1);
+  // Gain (1 = без изменений) — клиентский пост-обработчик (CSS brightness на видео),
+  // per-title. HLS не пересобираем: banding исключаем битностью выхода, а не гейном.
+  const [gain, setGain] = useState<number>(GAIN_DEFAULT);
+  // Глобальная битность выхода (8/10), переключатель рядом с субтитрами.
+  const [bitDepth, setBitDepth] = useState<8 | 10>(() => {
+    try {
+      return localStorage.getItem(BD_STORAGE_KEY) === '10' ? 10 : 8;
+    } catch {
+      return 8;
+    }
+  });
+  // Поддерживает ли браузер 10-бит HEVC в MSE (у Edge без HEVC Video Extensions — нет).
+  const hevcMseSupported = useMemo(() => {
+    try {
+      const ms = typeof MediaSource !== 'undefined' ? MediaSource : null;
+      if (!ms || typeof ms.isTypeSupported !== 'function') return false;
+      return ms.isTypeSupported('video/mp4; codecs="hvc1.1.6.L120.90"');
+    } catch {
+      return false;
+    }
+  }, []);
+  // Фактическая битность: 10 доступна только если браузер умеет HEVC в MSE.
+  const effectiveBitDepth: 8 | 10 = hevcMseSupported ? bitDepth : 8;
   const [draft, setDraft] = useState<number | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [audioSel, setAudioSel] = useState(0);
   const [subSel, setSubSel] = useState(0);
   const [resSel, setResSel] = useState<number | null>(null);
+  const [qualitySel, setQualitySel] = useState<number>(DEFAULT_QUALITY);
   const [sessionStart, setSessionStart] = useState(0);
+  // Форсирует пересборку HLS-сессии при смене gain/битности (без перезагрузки при
+  // Direct Play, где gain применяется клиентским CSS).
+  const [hlsNonce, setHlsNonce] = useState(0);
   const [subWindowStart, setSubWindowStart] = useState(0);
   const [subCues, setSubCues] = useState<SubCue[]>([]);
   const [subSize, setSubSize] = useState(20);
   const [seeking, setSeeking] = useState(false);
   const [thumbPreview, setThumbPreview] = useState<{ index: number; frac: number } | null>(null);
-  // Видимость превью: показываем только после onLoad готового кадра (скрываем при 404).
-  const [thumbVisible, setThumbVisible] = useState(false);
-  // Для сброса thumbVisible при входе в ховер (а не при каждой смене слота — иначе мерцание).
-  const thumbPreviewPrevRef = useRef<{ index: number; frac: number } | null>(null);
-  useEffect(() => {
-    if (thumbPreview && thumbPreviewPrevRef.current === null) {
-      setThumbVisible(false);
-    }
-    thumbPreviewPrevRef.current = thumbPreview;
-  }, [thumbPreview]);
+  // Индекс картинки, которая реально загрузилась. Показываем превью только когда это
+  // текущий слот — так ушла гонка «onLoad сработал раньше сброса видимости».
+  const [thumbLoadedIndex, setThumbLoadedIndex] = useState<number | null>(null);
+  // Уже сгенерированные слоты превью: чтобы наводиться на «ближайший» кадр.
+  const thumbSlotsRef = useRef<number[]>([]);
 
   const duration = media?.durationSec && media.durationSec > 0 ? media.durationSec : videoDuration;
   const selectedAbs = media?.audioTracks[audioSel]?.index ?? null;
@@ -250,6 +312,54 @@ export function Player({
     ? (media.audioTracks.find((t) => t.default)?.index ?? media.audioTracks[0]?.index ?? null)
     : null;
   const directPlay = media ? media.canDirectPlay && selectedAbs === defaultAbs : false;
+
+  // Запуск воспроизведения с гейтом «10с натранскодированного кеша впереди».
+  // Если кеша достаточно (или сработал предохранитель) — играем сразу, иначе
+  // помечаем ожидание; watcher ниже запустит play, когда transcodedSec дорастёт.
+  const requestPlay = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (directPlay) {
+      playPendingRef.current = false;
+      video.play().catch(() => {});
+      return;
+    }
+    const ahead = (transcodedSecRef.current ?? 0) - video.currentTime;
+    if (ahead >= PLAY_BUFFER_AHEAD_SEC || Date.now() >= playGateDeadlineRef.current) {
+      playPendingRef.current = false;
+      video.play().catch(() => {});
+    } else {
+      playPendingRef.current = true;
+      setBuffering(true);
+    }
+  }, [directPlay]);
+
+  // Watcher гейта: на каждом обновлении transcodedSec (статус опрашивается раз в 2с)
+  // и предохранителе — пробуем стартовать.
+  useEffect(() => {
+    transcodedSecRef.current = transcodedSec;
+    if (playPendingRef.current) requestPlay();
+  }, [transcodedSec, requestPlay]);
+
+  // Gain применяется клиентски (CSS brightness = умножение в гамма-пространстве, якорь
+  // в нуле — как «gain» в грейдинге). Мгновенно, без пересборки HLS.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.style.filter = gain === GAIN_DEFAULT ? '' : `brightness(${gain})`;
+  }, [gain, loading]);
+
+  // Сохраняем gain в историю (per-title) с небольшим дебаунсом от спама.
+  const gainPersistTimerRef = useRef<number | null>(null);
+  const changeGain = (value: number) => {
+    const g = Math.min(GAIN_MAX, Math.max(GAIN_MIN, value));
+    setGain(g);
+    if (gainPersistTimerRef.current) window.clearTimeout(gainPersistTimerRef.current);
+    gainPersistTimerRef.current = window.setTimeout(() => {
+      gainPersistTimerRef.current = null;
+      api.historySetGain(topicId, g).catch(() => {});
+    }, 600);
+  };
 
   // Сохраняет прогресс просмотра на сервере (в записи истории). force — финальное
   // сохранение при размонтировании: игнорируем дельту, но не порог «просмотрено
@@ -278,6 +388,11 @@ export function Player({
     api.historySetTracks(topicId, p.audioTrack, p.subtitleTrack).catch(() => {});
   };
 
+  // Сохраняет выбранную ступень качества транскода на сервере, в записи истории.
+  const persistQuality = (level: number) => {
+    api.historySetQuality(topicId, level).catch(() => {});
+  };
+
   useEffect(() => {
     let cancelled = false;
     firstPlaySentRef.current = false;
@@ -294,7 +409,7 @@ export function Player({
     setMenuOpen(false);
     setAudioMenuOpen(false);
     setSubMenuOpen(false);
-    setSettingsOpen(false);
+    setQualityMenuOpen(false);
     const prevVideo = videoRef.current;
     if (prevVideo) {
       try {
@@ -318,6 +433,8 @@ export function Player({
         audioTrack: null,
         subtitleTrack: null,
         resCeiling: null,
+        qualityLevel: null,
+        gain: null,
       })),
     ])
       .then(([f, resume]) => {
@@ -332,6 +449,8 @@ export function Player({
           audioTrack: resume.audioTrack ?? null,
           subtitleTrack: resume.subtitleTrack ?? null,
           resCeiling: resume.resCeiling ?? null,
+          qualityLevel: resume.qualityLevel ?? null,
+          gain: resume.gain ?? null,
         };
         const target =
           resume.fileIndex != null ? f.find((x) => x.index === resume.fileIndex && x.isVideo) : null;
@@ -427,6 +546,20 @@ export function Player({
             ? savedRes
             : fullRes,
         );
+        // Ступень качества транскода: из истории, если валидна, иначе по умолчанию.
+        const savedQ = avPrefsRef.current.qualityLevel;
+        setQualitySel(
+          savedQ != null && savedQ >= 0 && savedQ < QUALITY_OPTIONS.length
+            ? savedQ
+            : DEFAULT_QUALITY,
+        );
+        // Gain исходника из истории (per-title).
+        const savedGain = avPrefsRef.current.gain;
+        setGain(
+          savedGain != null && savedGain > 0
+            ? Math.min(GAIN_MAX, Math.max(GAIN_MIN, savedGain))
+            : GAIN_DEFAULT,
+        );
         mediaFileRef.current = fileIndex;
         setMedia(m);
         setLoading(false);
@@ -445,6 +578,27 @@ export function Player({
   useEffect(() => {
     if (fileIndex == null) return;
     api.thumbnailsEnsure(topicId, fileIndex);
+  }, [topicId, fileIndex]);
+
+  // Список уже сгенерированных слотов превью: по нему при наведении показываем
+  // ближайший существующий кадр (а не только точный таймкод). Обновляем периодически.
+  useEffect(() => {
+    if (fileIndex == null) return;
+    let alive = true;
+    const load = () => {
+      api
+        .thumbnailsMeta(topicId, fileIndex)
+        .then((m) => {
+          if (alive) thumbSlotsRef.current = m.slots ?? [];
+        })
+        .catch(() => {});
+    };
+    load();
+    const iv = window.setInterval(load, 5000);
+    return () => {
+      alive = false;
+      window.clearInterval(iv);
+    };
   }, [topicId, fileIndex]);
 
   useEffect(() => {
@@ -569,13 +723,18 @@ export function Player({
         const reason = data.reason ? ` — ${data.reason}` : '';
         setError(`Ошибка HLS: ${data.type}${detail}${reason}`);
       });
-      hls.loadSource(hlsPlaylistUrl(topicId, fileIndex, selectedAbs, sessionStart, resSel));
+      hls.loadSource(
+        hlsPlaylistUrl(topicId, fileIndex, selectedAbs, sessionStart, resSel, qualitySel, effectiveBitDepth),
+      );
       hls.attachMedia(video);
       if (shouldAutoPlay) {
-        video.play().catch(() => {});
+        // Гейт: не играем, пока впереди нет PLAY_BUFFER_AHEAD_SEC секунд кеша.
+        playGateDeadlineRef.current = Date.now() + PLAY_GATE_TIMEOUT_MS;
+        playPendingRef.current = true;
+        requestPlay();
       }
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = hlsPlaylistUrl(topicId, fileIndex, selectedAbs, sessionStart, resSel);
+      video.src = hlsPlaylistUrl(topicId, fileIndex, selectedAbs, sessionStart, resSel, qualitySel, effectiveBitDepth);
       if (resumeReal != null && resumeReal > 0) {
         nativeRestore = () => {
           const v = videoRef.current;
@@ -584,7 +743,9 @@ export function Player({
         video.addEventListener('loadedmetadata', nativeRestore);
       }
       if (shouldAutoPlay) {
-        video.play().catch(() => {});
+        playGateDeadlineRef.current = Date.now() + PLAY_GATE_TIMEOUT_MS;
+        playPendingRef.current = true;
+        requestPlay();
       }
     } else {
       setError('HLS не поддерживается этим браузером.');
@@ -597,7 +758,7 @@ export function Player({
       }
       if (nativeRestore) video.removeEventListener('loadedmetadata', nativeRestore);
     };
-  }, [topicId, fileIndex, media, audioSel, resSel, sessionStart, directPlay, selectedAbs, retryNonce]);
+  }, [topicId, fileIndex, media, audioSel, resSel, qualitySel, sessionStart, directPlay, selectedAbs, retryNonce, hlsNonce, requestPlay]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -635,7 +796,8 @@ export function Player({
       }
     };
     const onMeta = () => {
-      setBuffering(false);
+      // Не снимаем «буферизацию», пока держит гейт старта (ждём кеш впереди).
+      if (!playPendingRef.current) setBuffering(false);
       const d = video.duration;
       if (Number.isFinite(d) && d > 0) setVideoDuration(d);
     };
@@ -761,6 +923,9 @@ export function Player({
       start: sessionStart,
       pos: sessionStart + currentTime,
       res: resSel,
+      quality: qualitySel,
+      bd: effectiveBitDepth,
+      paused: videoRef.current ? videoRef.current.paused : false,
     };
   });
 
@@ -855,7 +1020,7 @@ export function Player({
       if (target && target.closest) {
         if (
           target.closest(
-            'button, a, input, textarea, select, [role="button"], [role="slider"], .player-menu, .player-settings, .player-ep-wrap, .dropdown, .sort-menu',
+            'button, a, input, textarea, select, [role="button"], [role="slider"], .player-menu, .player-ep-wrap, .dropdown, .sort-menu',
           )
         ) {
           return;
@@ -865,7 +1030,12 @@ export function Player({
       if (!video) return;
       if (e.key === ' ' || e.key === 'k') {
         e.preventDefault();
-        video.paused ? video.play() : video.pause();
+        if (video.paused) {
+          if (!directPlay) playGateDeadlineRef.current = Date.now() + PLAY_GATE_TIMEOUT_MS;
+          requestPlay();
+        } else {
+          video.pause();
+        }
       } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         e.preventDefault();
         const delta = e.key === 'ArrowLeft' ? -5 : 5;
@@ -900,7 +1070,12 @@ export function Player({
   const togglePlay = () => {
     const video = videoRef.current;
     if (!video) return;
-    video.paused ? video.play() : video.pause();
+    if (video.paused) {
+      if (!directPlay) playGateDeadlineRef.current = Date.now() + PLAY_GATE_TIMEOUT_MS;
+      requestPlay();
+    } else {
+      video.pause();
+    }
   };
 
   const toggleMute = () => {
@@ -943,7 +1118,7 @@ export function Player({
   const isControlTarget = (target: EventTarget | null): boolean => {
     if (!(target instanceof Element)) return false;
     return !!target.closest(
-      'button, a, .player-seek, .player-menu, .player-ep-wrap, .player-volume, .player-top, .player-bottom, .player-settings',
+      'button, a, .player-seek, .player-menu, .player-ep-wrap, .player-volume, .player-top, .player-bottom',
     );
   };
 
@@ -1052,6 +1227,58 @@ const toggleFullscreen = () => {
     setSeeking(true);
   };
 
+  // Смена ступени качества транскода (QP): перезапускаем HLS-сессию с текущей позиции.
+  const selectQuality = (i: number) => {
+    if (i === qualitySel) return;
+    avPrefsRef.current = { ...avPrefsRef.current, qualityLevel: i };
+    setQualitySel(i);
+    persistQuality(i);
+    // При прямом воспроизведении транскода нет — качество не влияет на поток,
+    // просто запоминаем выбор.
+    if (directPlay) return;
+    const video = videoRef.current;
+    const real = sessionStart + (video?.currentTime ?? 0);
+    autoPlayRef.current = !video?.paused;
+    resumeRealRef.current = real;
+    setSessionStart(roundStart(real));
+    setCurrentTime(0);
+    setSubWindowStart(Math.max(0, real - SUB_LEAD));
+    setPlaying(false);
+    setBuffering(true);
+    setTranscodedSec(null);
+    seekStartRef.current = performance.now();
+    setSeeking(true);
+  };
+
+  // Пересоздаём HLS-сессию с текущей позиции (общий кусок для res/quality/gain/битности).
+  const restartSession = (video: HTMLVideoElement | null) => {
+    const real = sessionStart + (video?.currentTime ?? 0);
+    autoPlayRef.current = !video?.paused;
+    resumeRealRef.current = real;
+    setSessionStart(roundStart(real));
+    setCurrentTime(0);
+    setSubWindowStart(Math.max(0, real - SUB_LEAD));
+    setPlaying(false);
+    setBuffering(true);
+    setTranscodedSec(null);
+    seekStartRef.current = performance.now();
+    setSeeking(true);
+    setHlsNonce((n) => n + 1);
+  };
+
+  // Выбор битности выхода (8/10), глобально. 10 => HEVC без откатов.
+  const selectBitDepth = (next: 8 | 10) => {
+    if (!hevcMseSupported || next === effectiveBitDepth) return;
+    setBitDepth(next);
+    try {
+      localStorage.setItem(BD_STORAGE_KEY, String(next));
+    } catch {
+      /* ignore */
+    }
+    if (directPlay) return;
+    restartSession(videoRef.current);
+  };
+
   const seekTo = (target: number) => {
     const video = videoRef.current;
     if (!video) return;
@@ -1090,7 +1317,31 @@ const toggleFullscreen = () => {
   const previewForFrac = (frac: number): { index: number; frac: number } | null => {
     if (!duration || duration <= 0) return null;
     const t = frac * duration;
-    return { index: Math.floor(t / THUMB_INTERVAL_SEC), frac };
+    const exact = Math.floor(t / THUMB_INTERVAL_SEC);
+    const slots = thumbSlotsRef.current;
+    if (slots.length === 0) return { index: exact, frac };
+    // Ближайший сгенерированный слот (бинарный поиск по отсортированному списку).
+    let lo = 0;
+    let hi = slots.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (slots[mid] < exact) lo = mid + 1;
+      else hi = mid;
+    }
+    let best = -1;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (const i of [lo - 1, lo]) {
+      if (i < 0 || i >= slots.length) continue;
+      const dist = Math.abs(slots[i] - exact);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = slots[i];
+      }
+    }
+    // Показываем ближайший кадр, только если он в пределах ±5 минут (±30 слотов).
+    // Иначе — точный слот (сервер отдаст ближайший в том же окне или ничего).
+    const within = bestDist <= THUMB_NEAREST_WINDOW_SLOTS;
+    return { index: within && best >= 0 ? best : exact, frac };
   };
 
   const onSeekDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -1165,7 +1416,13 @@ const toggleFullscreen = () => {
   const aheadSec =
     !directPlay && transcodedSec != null ? Math.max(0, transcodedSec - currentTime) : null;
   const overlayShow =
-    controlsVisible || !playing || menuOpen || settingsOpen || audioMenuOpen || subMenuOpen;
+    controlsVisible ||
+    !playing ||
+    menuOpen ||
+    audioMenuOpen ||
+    subMenuOpen ||
+    gainMenuOpen ||
+    qualityMenuOpen;
 
   const selectedSub = subSel > 0 ? media?.subtitleTracks[subSel - 1] : null;
   const activeCue =
@@ -1222,6 +1479,8 @@ const toggleFullscreen = () => {
                       setMenuOpen((v) => !v);
                       setAudioMenuOpen(false);
                       setSubMenuOpen(false);
+                      setQualityMenuOpen(false);
+                      setGainMenuOpen(false);
                     }}
                   >
                     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
@@ -1258,6 +1517,8 @@ const toggleFullscreen = () => {
                     setAudioMenuOpen((v) => !v);
                     setMenuOpen(false);
                     setSubMenuOpen(false);
+                    setQualityMenuOpen(false);
+                    setGainMenuOpen(false);
                   }}
                 >
                   <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
@@ -1295,6 +1556,8 @@ const toggleFullscreen = () => {
                     setSubMenuOpen((v) => !v);
                     setMenuOpen(false);
                     setAudioMenuOpen(false);
+                    setQualityMenuOpen(false);
+                    setGainMenuOpen(false);
                   }}
                 >
                   <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
@@ -1333,6 +1596,142 @@ const toggleFullscreen = () => {
                           : `${trackLabel(t, i, 'sub')} · не поддерживается`}
                       </button>
                     ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="player-ep-wrap">
+                <button
+                  className="player-ep-btn"
+                  onClick={() => {
+                    setGainMenuOpen((v) => !v);
+                    setMenuOpen(false);
+                    setAudioMenuOpen(false);
+                    setSubMenuOpen(false);
+                    setQualityMenuOpen(false);
+                  }}
+                >
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
+                    <circle cx="12" cy="12" r="4" />
+                    <path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2" strokeLinecap="round" />
+                  </svg>
+                  Gain
+                </button>
+                {gainMenuOpen && (
+                  <div className="player-menu player-menu-gain">
+                    <div className="player-gain-head">
+                      <span>Gain</span>
+                      <span className="player-gain-val">{gain.toFixed(2)}×</span>
+                    </div>
+                    <input
+                      className="player-gain-range"
+                      type="range"
+                      min={GAIN_MIN}
+                      max={GAIN_MAX}
+                      step={0.01}
+                      value={gain}
+                      onChange={(e) => changeGain(Number.parseFloat(e.target.value))}
+                      aria-label="Gain"
+                    />
+                    <button
+                      className="player-menu-item"
+                      onClick={() => changeGain(GAIN_DEFAULT)}
+                      disabled={gain === GAIN_DEFAULT}
+                    >
+                      Сброс (1.00×)
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Единая пилюля «Качество»: битность + разрешение + ступень QP в
+                  трёх столбиках. Разрешение раньше жило в шестерёнке снизу. */}
+              <div className="player-ep-wrap">
+                <button
+                  className="player-ep-btn"
+                  onClick={() => {
+                    setQualityMenuOpen((v) => !v);
+                    setMenuOpen(false);
+                    setAudioMenuOpen(false);
+                    setSubMenuOpen(false);
+                    setGainMenuOpen(false);
+                  }}
+                >
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M4 18V9M9 18V5M14 18v-6M19 18V7" strokeLinecap="round" />
+                  </svg>
+                  Качество
+                </button>
+                {qualityMenuOpen && (
+                  <div className="player-menu player-quality-menu">
+                    <div className="player-quality-col">
+                      <div className="player-quality-title">Битность</div>
+                      {([10, 8] as const).map((bd) => (
+                        <button
+                          key={bd}
+                          className={`player-menu-item ${effectiveBitDepth === bd ? 'active' : ''}`}
+                          onClick={() => selectBitDepth(bd)}
+                          disabled={bd === 10 && !hevcMseSupported}
+                          title={
+                            bd === 10 && !hevcMseSupported
+                              ? '10-бит (HEVC) недоступен: браузер не поддерживает HEVC в MSE.'
+                              : undefined
+                          }
+                        >
+                          {bd} бит
+                        </button>
+                      ))}
+                    </div>
+
+                    {directPlay ? (
+                      <div className="player-quality-col">
+                        <div className="player-quality-title">Поток</div>
+                        <div className="player-menu-empty">Прямое воспроизведение</div>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="player-quality-col">
+                          <div className="player-quality-title">Разрешение</div>
+                          {(() => {
+                            const opts = RES_OPTIONS.filter(
+                              (r) => r <= fullResFor(media?.height),
+                            );
+                            return opts.length > 0 ? (
+                              opts.map((r) => (
+                                <button
+                                  key={r}
+                                  className={`player-menu-item ${resSel === r ? 'active' : ''}`}
+                                  onClick={() => {
+                                    selectRes(r);
+                                    setQualityMenuOpen(false);
+                                  }}
+                                >
+                                  {resLabel(r)}
+                                </button>
+                              ))
+                            ) : (
+                              <div className="player-menu-empty">Исходное</div>
+                            );
+                          })()}
+                        </div>
+
+                        <div className="player-quality-col">
+                          <div className="player-quality-title">Качество</div>
+                          {QUALITY_OPTIONS.map((label, i) => (
+                            <button
+                              key={label}
+                              className={`player-menu-item ${qualitySel === i ? 'active' : ''}`}
+                              onClick={() => {
+                                selectQuality(i);
+                                setQualityMenuOpen(false);
+                              }}
+                            >
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    )}
                   </div>
                 )}
               </div>
@@ -1378,11 +1777,19 @@ const toggleFullscreen = () => {
                   style={{ left: `${thumbPreview.frac * 100}%` }}
                 >
                   <img
+                    key={thumbPreview.index}
                     src={thumbnailUrl(topicId, fileIndex, thumbPreview.index)}
                     alt=""
-                    style={{ visibility: thumbVisible ? 'visible' : 'hidden' }}
-                    onLoad={() => setThumbVisible(true)}
-                    onError={() => setThumbVisible(false)}
+                    style={{
+                      visibility:
+                        thumbLoadedIndex === thumbPreview.index ? 'visible' : 'hidden',
+                    }}
+                    onLoad={() => setThumbLoadedIndex(thumbPreview.index)}
+                    onError={() =>
+                      setThumbLoadedIndex((cur) =>
+                        cur === thumbPreview.index ? null : cur,
+                      )
+                    }
                   />
                   <div className="player-seek-preview-time">
                     {formatTime(thumbPreview.index * THUMB_INTERVAL_SEC)}
@@ -1438,51 +1845,6 @@ const toggleFullscreen = () => {
                 <div className="player-volume-fill" />
                 <div className="player-volume-thumb" />
               </div>
-            </div>
-
-            <div className="player-settings-wrap">
-              <button
-                className="player-ctl"
-                onClick={() => {
-                  setSettingsOpen((v) => !v);
-                  setMenuOpen(false);
-                  setAudioMenuOpen(false);
-                  setSubMenuOpen(false);
-                }}
-                aria-label="Настройки"
-              >
-                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="3" />
-                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-                </svg>
-              </button>
-              {settingsOpen && (
-                <div className="player-settings">
-                  {!directPlay && (
-                    <div className="player-settings-group">
-                      <div className="player-settings-title">Качество</div>
-                      {(() => {
-                        const opts = RES_OPTIONS.filter(
-                          (r) => r <= fullResFor(media?.height),
-                        );
-                        return opts.length > 0 ? (
-                          opts.map((r) => (
-                            <button
-                              key={r}
-                              className={`player-menu-item ${resSel === r ? 'active' : ''}`}
-                              onClick={() => selectRes(r)}
-                            >
-                              {resLabel(r)}
-                            </button>
-                          ))
-                        ) : (
-                          <div className="player-menu-empty">Исходное разрешение</div>
-                        );
-                      })()}
-                    </div>
-                  )}
-                </div>
-              )}
             </div>
 
             <button className="player-ctl" onClick={toggleFullscreen} aria-label="Во весь экран">

@@ -39,6 +39,10 @@ export interface HistoryEntry {
   // Выбранный потолок качества транскода (высота в px: 2160/1440/1080/720/480/360).
   // null = не задан (использовать полное качество исходника).
   resCeiling?: number | null;
+  // Выбранная ступень качества транскода (0..6, см. quality.ts). null = не задана.
+  qualityLevel?: number | null;
+  // Gain исходника (1 = выключено) для этой раздачи.
+  gain?: number | null;
 }
 
 const HISTORY_MAX = 20;
@@ -287,6 +291,8 @@ export class Store {
       if (merged.audioTrack == null) merged.audioTrack = prev.audioTrack;
       if (merged.subtitleTrack == null) merged.subtitleTrack = prev.subtitleTrack;
       if (merged.resCeiling == null) merged.resCeiling = prev.resCeiling;
+      if (merged.qualityLevel == null) merged.qualityLevel = prev.qualityLevel;
+      if (merged.gain == null) merged.gain = prev.gain;
     }
     this.history = [merged, ...this.history.filter((e) => e.id !== entry.id)].slice(0, HISTORY_MAX);
     writeJson(HISTORY_FILE, this.history);
@@ -317,6 +323,8 @@ export class Store {
     audioTrack: number | null;
     subtitleTrack: number | null;
     resCeiling: number | null;
+    qualityLevel: number | null;
+    gain: number | null;
   } {
     const e = this.history.find((x) => x.id === id);
     if (!e) {
@@ -328,6 +336,8 @@ export class Store {
         audioTrack: null,
         subtitleTrack: null,
         resCeiling: null,
+        qualityLevel: null,
+        gain: null,
       };
     }
     return {
@@ -338,6 +348,8 @@ export class Store {
       audioTrack: e.audioTrack ?? null,
       subtitleTrack: e.subtitleTrack ?? null,
       resCeiling: e.resCeiling ?? null,
+      qualityLevel: e.qualityLevel ?? null,
+      gain: e.gain ?? null,
     };
   }
 
@@ -377,6 +389,24 @@ export class Store {
     const e = this.history.find((x) => x.id === id);
     if (!e) return false;
     e.resCeiling = resCeiling;
+    writeJson(HISTORY_FILE, this.history);
+    return true;
+  }
+
+  // Выбранная ступень качества транскода (0..6, см. quality.ts).
+  setHistoryQuality(id: number, qualityLevel: number | null): boolean {
+    const e = this.history.find((x) => x.id === id);
+    if (!e) return false;
+    e.qualityLevel = qualityLevel;
+    writeJson(HISTORY_FILE, this.history);
+    return true;
+  }
+
+  // Выбранный gain исходника (1 = выключено) для раздачи.
+  setHistoryGain(id: number, gain: number | null): boolean {
+    const e = this.history.find((x) => x.id === id);
+    if (!e) return false;
+    e.gain = gain;
     writeJson(HISTORY_FILE, this.history);
     return true;
   }

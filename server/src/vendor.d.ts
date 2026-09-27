@@ -1,3 +1,8 @@
+declare module 'bencode' {
+  const bencode: { decode(data: Buffer | Uint8Array | string): Record<string, unknown> };
+  export default bencode;
+}
+
 declare module 'parse-torrent' {
   export interface ParsedTorrent {
     infoHash: string;

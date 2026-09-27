@@ -14,7 +14,7 @@ async function withServer(
 ): Promise<void> {
   const services = {
     noteClientActivity: (id: number) => seen.push(id),
-    thumbnails: { coverage: () => 0, total: () => null },
+    thumbnails: { coverage: () => 0, total: () => null, slots: () => [] },
   } as unknown as Services;
   const app = express();
   app.use('/api', createApi(services));

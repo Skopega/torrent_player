@@ -90,7 +90,7 @@ export const api = {
   async streamStatus(
     topicId: number,
     fileIndex?: number,
-    opts?: { audio?: number | null; start?: number; pos?: number; res?: number | null },
+    opts?: { audio?: number | null; start?: number; pos?: number; res?: number | null; quality?: number | null; bd?: number | null; paused?: boolean },
     signal?: AbortSignal,
   ): Promise<StreamStatus> {
     const params = new URLSearchParams();
@@ -99,6 +99,9 @@ export const api = {
     if (opts?.start) params.set('start', String(opts.start));
     if (opts?.pos) params.set('pos', String(opts.pos));
     if (opts?.res != null) params.set('res', String(opts.res));
+    if (opts?.quality != null) params.set('quality', String(opts.quality));
+    if (opts?.bd != null) params.set('bd', String(opts.bd));
+    if (opts?.paused != null) params.set('paused', opts.paused ? '1' : '0');
     const q = params.toString();
     return json(
       await fetch(`/api/topic/${topicId}/stream/status${q ? `?${q}` : ''}`, { signal }),
@@ -106,7 +109,9 @@ export const api = {
   },
 
   async streamStop(topicId: number): Promise<void> {
-    await json<{ ok: boolean }>(await fetch(`/api/topic/${topicId}/stream/stop`, { method: 'POST' }));
+    await json<{ ok: boolean }>(
+      await fetch(`/api/topic/${topicId}/stream/stop`, { method: 'POST', keepalive: true }),
+    );
   },
 
   warmStream(topicId: number): void {
@@ -143,6 +148,15 @@ export const api = {
     void fetch(`/api/topic/${topicId}/stream/${fileIndex}/thumbnails`, {
       method: 'POST',
     }).catch(() => {});
+  },
+
+  async thumbnailsMeta(
+    topicId: number,
+    fileIndex: number,
+  ): Promise<{ intervalSec: number; count: number; total: number | null; slots: number[] }> {
+    return json(
+      await fetch(`/api/topic/${topicId}/stream/${fileIndex}/thumbnails/meta`),
+    );
   },
 
   async cacheSize(): Promise<number> {
@@ -217,6 +231,26 @@ export const api = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ resCeiling }),
+      }),
+    );
+  },
+
+  async historySetQuality(topicId: number, qualityLevel: number | null): Promise<void> {
+    await json<{ ok: boolean }>(
+      await fetch(`/api/history/${topicId}/quality`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ qualityLevel }),
+      }),
+    );
+  },
+
+  async historySetGain(topicId: number, gain: number | null): Promise<void> {
+    await json<{ ok: boolean }>(
+      await fetch(`/api/history/${topicId}/gain`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gain }),
       }),
     );
   },
@@ -361,11 +395,15 @@ export function hlsPlaylistUrl(
   audio?: number | null,
   startSec?: number,
   res?: number | null,
+  quality?: number | null,
+  bd?: number | null,
 ): string {
   const params: string[] = [];
   if (audio != null) params.push(`audio=${audio}`);
   if (startSec) params.push(`start=${startSec}`);
   if (res != null) params.push(`res=${res}`);
+  if (quality != null) params.push(`quality=${quality}`);
+  if (bd != null) params.push(`bd=${bd}`);
   const q = params.length ? `?${params.join('&')}` : '';
   return `/api/topic/${topicId}/stream/${fileIndex}/playlist.m3u8${q}`;
 }
@@ -387,6 +425,9 @@ export function subtitleUrl(
 
 // Интервал превью (должен совпадать с THUMB_INTERVAL_SEC на сервере, thumbnails.ts).
 export const THUMB_INTERVAL_SEC = 10;
+// Окно «ближайшего» превью в слотах (совпадает с THUMB_NEAREST_WINDOW_SLOTS на сервере).
+// ±30 слотов при шаге 10 с = ±5 минут.
+export const THUMB_NEAREST_WINDOW_SLOTS = 30;
 
 export function thumbnailUrl(topicId: number, fileIndex: number, index: number): string {
   const name = `thumb${String(Math.max(0, index)).padStart(6, '0')}.jpg`;

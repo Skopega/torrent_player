@@ -52,6 +52,8 @@ const NO_RESUME = {
   audioTrack: null,
   subtitleTrack: null,
   resCeiling: null,
+  qualityLevel: null,
+  gain: null,
 };
 
 const fullResume = (over: Record<string, unknown>) => ({ ...NO_RESUME, ...over });
@@ -100,6 +102,16 @@ test('history: setHistoryRes persists transcode ceiling', () => {
   assert.deepEqual(s.getHistoryResume(8), fullResume({ resCeiling: null }));
 });
 
+test('history: setHistoryQuality persists quality level', () => {
+  const s = freshStore();
+  s.addHistory(entry(9));
+  assert.equal(s.setHistoryQuality(9, 0), true);
+  assert.deepEqual(s.getHistoryResume(9), fullResume({ qualityLevel: 0 }));
+  assert.equal(s.getHistory()[0].qualityLevel, 0);
+  assert.equal(s.setHistoryQuality(9, 6), true);
+  assert.deepEqual(s.getHistoryResume(9), fullResume({ qualityLevel: 6 }));
+});
+
 test('history: setters for missing id are a no-op', () => {
   const s = freshStore();
   s.addHistory(entry(5));
@@ -107,6 +119,7 @@ test('history: setters for missing id are a no-op', () => {
   assert.equal(s.setHistoryVolume(999, 0.5, false), false);
   assert.equal(s.setHistoryTracks(999, 1, 2), false);
   assert.equal(s.setHistoryRes(999, 720), false);
+  assert.equal(s.setHistoryQuality(999, 3), false);
   assert.equal(s.getHistory().length, 1);
   assert.deepEqual(s.getHistoryResume(999), NO_RESUME);
 });
@@ -118,6 +131,7 @@ test('history: re-add keeps saved settings when entry lacks them', () => {
   assert.equal(s.setHistoryVolume(6, 0.6, false), true);
   assert.equal(s.setHistoryTracks(6, 2, 5), true);
   assert.equal(s.setHistoryRes(6, 1080), true);
+  assert.equal(s.setHistoryQuality(6, 2), true);
   s.addHistory(entry(6, 'after'));
   const e = s.getHistory()[0];
   assert.equal(e.title, 'after');
@@ -128,9 +142,10 @@ test('history: re-add keeps saved settings when entry lacks them', () => {
   assert.equal(e.audioTrack, 2);
   assert.equal(e.subtitleTrack, 5);
   assert.equal(e.resCeiling, 1080);
+  assert.equal(e.qualityLevel, 2);
   assert.deepEqual(
     s.getHistoryResume(6),
-    fullResume({ fileIndex: 7, position: 1200, volume: 0.6, muted: false, audioTrack: 2, subtitleTrack: 5, resCeiling: 1080 }),
+    fullResume({ fileIndex: 7, position: 1200, volume: 0.6, muted: false, audioTrack: 2, subtitleTrack: 5, resCeiling: 1080, qualityLevel: 2 }),
   );
 });
 
