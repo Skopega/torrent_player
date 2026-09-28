@@ -254,6 +254,14 @@ export default function App() {
   const prefetchedRef = useRef<Set<number>>(new Set());
   const pendingRef = useRef<number[]>([]);
   const hoverTimerRef = useRef<number | null>(null);
+  // При размонтировании не оставляем висящие таймеры/запросы.
+  useEffect(
+    () => () => {
+      if (hoverTimerRef.current) window.clearTimeout(hoverTimerRef.current);
+      abortRef.current?.abort();
+    },
+    [],
+  );
 
   const prefetch = useCallback(
     (id: number) => {
@@ -281,17 +289,20 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [results]);
 
-  const enrichedResults =
-    results?.map((r) => {
-      const e = extra[String(r.id)];
-      return {
-        ...r,
-        poster: r.poster ?? e?.poster ?? null,
-        bitrate: e?.bitrate ?? null,
-        resolution: e?.resolution ?? r.resolution ?? null,
-        duration: r.duration ?? e?.duration ?? null,
-      };
-    }) ?? null;
+  const enrichedResults = useMemo(
+    () =>
+      results?.map((r) => {
+        const e = extra[String(r.id)];
+        return {
+          ...r,
+          poster: r.poster ?? e?.poster ?? null,
+          bitrate: e?.bitrate ?? null,
+          resolution: e?.resolution ?? r.resolution ?? null,
+          duration: r.duration ?? e?.duration ?? null,
+        };
+      }) ?? null,
+    [results, extra],
+  );
 
   const sizeBounds = useMemo<[number, number]>(() => {
     if (!results || results.length === 0) return [0, 1];

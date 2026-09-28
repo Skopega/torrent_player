@@ -423,11 +423,8 @@ export function subtitleUrl(
   return `/api/topic/${topicId}/stream/${fileIndex}/subtitle/${streamIndex}.vtt${q}`;
 }
 
-// Интервал превью (должен совпадать с THUMB_INTERVAL_SEC на сервере, thumbnails.ts).
-export const THUMB_INTERVAL_SEC = 10;
-// Окно «ближайшего» превью в слотах (совпадает с THUMB_NEAREST_WINDOW_SLOTS на сервере).
-// ±30 слотов при шаге 10 с = ±5 минут.
-export const THUMB_NEAREST_WINDOW_SLOTS = 30;
+// Интервал/окно превью — в общем модуле констант (один источник на клиенте).
+export { THUMB_INTERVAL_SEC, THUMB_NEAREST_WINDOW_SLOTS } from './constants';
 
 export function thumbnailUrl(topicId: number, fileIndex: number, index: number): string {
   const name = `thumb${String(Math.max(0, index)).padStart(6, '0')}.jpg`;

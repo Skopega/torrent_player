@@ -133,6 +133,9 @@ interface HlsSession {
   feedRatio: number;
   // Сколько раз сессию перезапускали из-за зависшего ffmpeg (0 сегментов, процесс жив).
   restarts: number;
+  // Поколение процесса: инкремент в spawn() инвалидирует close/error-хендлеры
+  // прежнего процесса, чтобы они не сбрасывали proc/state новой сессии.
+  spawnGen: number;
 }
 
 interface ProgressTrack {
@@ -167,6 +170,10 @@ export class HlsManager {
   // Каталоги сессий, которые ещё готовятся (созданы, но сессия ещё не в `sessions`).
   // Нужны, чтобы orphan-скан removeCacheExcept не удалил каталог стартующей сессии.
   private preparingDirs = new Set<string>();
+  // Ключи start(), отменённые stopFile/stopTopic в окне ДО регистрации сессии
+  // (между probe/getFile и sessions.set): такие сессии не видны в sessions/byId,
+  // поэтому stop их не находил и ffmpeg всё равно поднимался без зрителя.
+  private cancelRequested = new Set<string>();
   // Число активных HTTP-читателей сессии (playlist/сегменты). Пока читают — нельзя
   // перезаписывать/удалять каталог, иначе клиент получит лавину 404 и «умрёт».
   private readers = new Map<string, number>();
@@ -310,6 +317,10 @@ export class HlsManager {
     for (const e of entries) {
       if (total <= HLS_MAX_BYTES) break;
       if (e.dir === keepDir || e.active) continue;
+      // Каталог, с которого прямо сейчас читают сегменты, не удаляем — иначе клиент
+      // получит лавину 404. (Как в pruneStaleSessions/recoverStuck/scheduleReuseRestart.)
+      const sess = this.sessions.get(e.key);
+      if (sess && (this.readers.get(sess.sessionId) ?? 0) > 0) continue;
       const size = await dirSizeAsync(e.dir);
       try {
         fs.rmSync(e.dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
@@ -344,9 +355,11 @@ export class HlsManager {
     p.then(
       () => {
         if (this.inFlight.get(key) === p) this.inFlight.delete(key);
+        this.cancelRequested.delete(key);
       },
       () => {
         if (this.inFlight.get(key) === p) this.inFlight.delete(key);
+        this.cancelRequested.delete(key);
       },
     );
     return p;
@@ -405,6 +418,13 @@ export class HlsManager {
     const media = await this.stream.probe(topicId, fileIndex);
     const { file } = await this.stream.getFile(topicId, fileIndex);
 
+    // stopFile/stopTopic, пришедший во время probe/getFile, не видит сессию (её ещё
+    // нет в sessions) — он помечает ключ в cancelRequested. Между этой проверкой и
+    // sessions.set нет await, поэтому отмена не «проскочит».
+    if (this.cancelRequested.delete(key)) {
+      throw new Error('hls start cancelled');
+    }
+
     const dir = path.join(
       HLS_DIR,
       `${topicId}_${fileIndex}_${audio ?? 'def'}_${startSec}_${res ?? 'full'}_q${quality}_g${gain}_${bitDepth}bit`,
@@ -443,11 +463,13 @@ export class HlsManager {
       speedMul: 0,
       feedRatio: 0,
       restarts: 0,
+      spawnGen: 0,
     };
     this.sessions.set(key, session);
     this.byId.set(session.sessionId, session);
     this.activeByFile.set(fkey, key);
-    this.preparingDirs.delete(dir);
+    // preparingDirs НЕ удаляем здесь: каталог остаётся защищённым от orphan-скана
+    // конкурентного removeCacheExcept, пока сессия готовится (до фактического spawn).
 
     // Заранее тянем seek-индекс (хвост: MKV Cues / MP4 moov / AVI idx1), чтобы -ss
     // делал быстрый seek, а не полный проход. Не блокируем redirect: ffmpeg сам
@@ -550,12 +572,14 @@ export class HlsManager {
       this.clearSegments(session.dir);
       session.transcodedEndSec = startSec;
       void this.spawn(session, startSec);
+      this.preparingDirs.delete(dir);
       log.info(
         `[hls] ${topicId}:${fileIndex} started (transcode, audio=${audio ?? 'default'} start=${startSec} res=${res ?? 'full'})`,
       );
     } else {
       // Сессию остановили во время подготовки (stopFile/stopOthers/abort) — не
       // запускаем ffmpeg и убираем сессию из карт.
+      this.preparingDirs.delete(dir);
       this.sessions.delete(key);
       this.byId.delete(session.sessionId);
       this.unmapIfActive(session);
@@ -903,6 +927,9 @@ export class HlsManager {
     // Остановили/удалили сессию до старта (stopSession во время подготовки) —
     // процесс не поднимаем.
     if (session.state === 'stopped' || session.state === 'error') return;
+    // Поколение процесса: любое продолжение старого close/error-хендлера после
+    // повторного spawn() увидит другой gen и не тронет proc/state новой сессии.
+    const gen = ++session.spawnGen;
     // Отсчёт «завис» и треки прогресса/скорости начинаем с момента запуска процесса.
     session.startedAt = Date.now();
     this.resetProgress(session);
@@ -1003,13 +1030,16 @@ export class HlsManager {
       }
     });
     proc.on('error', (err) => {
+      if (session.spawnGen !== gen) return;
       session.proc = null;
       if (session.state === 'stopped') return;
       this.retryOrFail(session, 1, stderr, err.message);
     });
     proc.on('close', (code) => {
+      if (session.spawnGen !== gen) return;
       session.proc = null;
       void this.scanPlaylist(session.dir).then(({ relSec }) => {
+        if (session.spawnGen !== gen) return;
         const nowEnd = session.startSec + relSec;
         session.transcodedEndSec = nowEnd;
         if (session.state === 'stopped') return;
@@ -1165,6 +1195,15 @@ export class HlsManager {
   }
 
   private stopSession(s: HlsSession): void {
+    // Отменяем отложенный ре-старт этой сессии (reusePending): иначе после явного
+    // останова (в т.ч. через stopFile при смене серии) таймер перезапустит ffmpeg
+    // без зрителя. Ключ reusePending = sessionKey.
+    const rk = this.sessionKey(s);
+    const pending = this.reusePending.get(rk);
+    if (pending) {
+      clearTimeout(pending);
+      this.reusePending.delete(rk);
+    }
     // Уже остановлена и процесс убит — повторный вызов (stopOthers при каждой
     // перемотке проходит по всем старым сессиям) не должен логировать и работать.
     if (s.state === 'stopped' && !s.proc) return;
@@ -1262,6 +1301,10 @@ export class HlsManager {
   }
 
   stopTopic(topicId: number): void {
+    // Отменяем ещё не зарегистрированные start() этого топика (окно probe/getFile).
+    for (const k of this.inFlight.keys()) {
+      if (k.startsWith(`${topicId}:`)) this.cancelRequested.add(k);
+    }
     for (const [, s] of this.sessions) {
       // 'starting'-сессии (proc ещё null) тоже останавливаем: иначе после подготовки
       // они всё равно заспавнились бы.
@@ -1277,6 +1320,14 @@ export class HlsManager {
         this.reusePending.delete(key);
       }
     }
+    // Чистим плейхеды топика: иначе карты растут по каждому файлу за всё время.
+    for (const k of [...this.playheads.keys()]) {
+      if (k.startsWith(`${topicId}:`)) {
+        this.playheads.delete(k);
+        this.playheadAt.delete(k);
+        this.playheadPaused.delete(k);
+      }
+    }
   }
 
   // Есть ли у топика сессии, которые реально готовятся/транскодируют. Нужно
@@ -1289,7 +1340,16 @@ export class HlsManager {
   }
 
   stopFile(topicId: number, fileIndex: number): void {
-    const key = this.activeByFile.get(this.fileKey(topicId, fileIndex));
+    // Отменяем start() этого файла, который ещё в подготовке (probe/getFile) и не
+    // зарегистрирован в sessions — иначе ffmpeg поднимется уже после останова.
+    for (const k of this.inFlight.keys()) {
+      if (k.startsWith(`${topicId}:${fileIndex}:`)) this.cancelRequested.add(k);
+    }
+    const fk = this.fileKey(topicId, fileIndex);
+    this.playheads.delete(fk);
+    this.playheadAt.delete(fk);
+    this.playheadPaused.delete(fk);
+    const key = this.activeByFile.get(fk);
     if (key) {
       const s = this.sessions.get(key);
       if (s) this.stopSession(s);
@@ -1365,6 +1425,16 @@ export class HlsManager {
       // Каталог сессии, которая ещё готовится (создана, но ещё не в sessions) —
       // не трогаем: её start() продолжит spawn после подготовки.
       if (this.preparingDirs.has(dir)) continue;
+      // Каталог зарегистрированной, но ещё готовящейся/активной сессии — тоже не
+      // трогаем (защита от кросс-удаления при конкурентных стартах).
+      let live = false;
+      for (const s of this.sessions.values()) {
+        if (s.dir === dir && (s.state === 'starting' || s.state === 'active')) {
+          live = true;
+          break;
+        }
+      }
+      if (live) continue;
       const ref = parseHlsDir(e.name);
       if (ref && matchesKeep(ref, keepTopicId, keepFileIndex)) continue;
       try {

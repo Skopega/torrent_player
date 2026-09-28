@@ -63,7 +63,6 @@ export const QUALITY_LEVELS: QualityLevel[] = [
     x264Crf: 21, x264Preset: 'faster',
   },
   {
-    // Дефолт — прежнее поведение.
     label: 'Standard · QP 23',
     vaapiQp: 23, vaapiEffort: 4,
     nvencCq: 23, nvencPreset: 'p4', nvencLookahead: 0, nvencMultipass: 0, nvencAq: false, nvencBref: false,
@@ -86,8 +85,8 @@ export const QUALITY_LEVELS: QualityLevel[] = [
   },
 ];
 
-// «Standard» (индекс 4).
-export const DEFAULT_QUALITY = 4;
+// «Very high» (индекс 1) — ступень по умолчанию.
+export const DEFAULT_QUALITY = 1;
 
 export function clampQuality(v: unknown): number {
   const n = Math.round(Number(v));

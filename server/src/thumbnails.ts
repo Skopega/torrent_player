@@ -896,11 +896,16 @@ export class ThumbnailManager {
         stdio: ['ignore', 'ignore', 'pipe'],
       }) as ChildProcess;
       job.proc = proc;
+      lowerChildPriority(proc);
       let stderr = '';
       proc.stderr?.on('data', (d) => {
         stderr = (stderr + d.toString()).slice(-2000);
       });
+      const timer = this.armProgressTimer(topicId, fileIndex, job, proc);
+      job.timer = timer;
       const finish = (outcome: 'ok' | 'paused' | 'error'): void => {
+        clearInterval(timer);
+        if (job.timer === timer) job.timer = null;
         if (job.proc === proc) job.proc = null;
         resolve(outcome);
       };
@@ -1213,19 +1218,13 @@ export class ThumbnailManager {
         this.knownTotals.delete(key);
       }
     }
-    this.pruneQueued((a) => a === topicId);
-  }
-
-  stopFile(topicId: number, fileIndex: number): void {
-    const key = this.key(topicId, fileIndex);
-    const job = this.jobs.get(key);
-    if (job) {
-      this.stopJob(job);
-      this.jobs.delete(key);
+    for (const k of this.sourceNotBefore.keys()) {
+      if (k.startsWith(`${topicId}:`)) this.sourceNotBefore.delete(k);
     }
-    this.pruneQueued((a, b) => a === topicId && b === fileIndex);
-    this.slotCache.delete(key);
-    this.knownTotals.delete(key);
+    for (const k of this.hlsUnavailableLogged) {
+      if (k.startsWith(`${topicId}:`)) this.hlsUnavailableLogged.delete(k);
+    }
+    this.pruneQueued((a) => a === topicId);
   }
 
   stopAll(): void {
@@ -1235,6 +1234,8 @@ export class ThumbnailManager {
     this.paused.clear();
     this.slotCache.clear();
     this.knownTotals.clear();
+    this.sourceNotBefore.clear();
+    this.hlsUnavailableLogged.clear();
     if (this.resumeTimer) clearTimeout(this.resumeTimer);
     this.resumeTimer = null;
   }

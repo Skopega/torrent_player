@@ -10,15 +10,17 @@ import {
   THUMB_NEAREST_WINDOW_SLOTS,
 } from '../api';
 import type { MediaInfo, StreamFile, StreamStatus, TrackInfo } from '../types';
+import {
+  RES_OPTIONS,
+  QUALITY_OPTIONS,
+  DEFAULT_QUALITY,
+  roundStart,
+} from '../constants';
 
 const SUB_WINDOW = 120;
 const SUB_LEAD = 10;
 const SUB_MARGIN = 30;
 const SUB_POLL_MS = 2000;
-// Должно совпадать с SEGMENT_SECONDS на сервере (hls.ts): позиция HLS-сессии
-// округляется до границы сегмента, чтобы кеш сегментов попадал при близких перемотках.
-const HLS_SEGMENT_SECONDS = 2;
-const roundStart = (t: number) => Math.max(0, Math.floor(t / HLS_SEGMENT_SECONDS) * HLS_SEGMENT_SECONDS);
 
 // Gain (яркость в стиле DaVinci «gain»): умножает исходник ДО энкода на сервере
 // (per-title). Пока тянем ползунок — мгновенный клиентский превью (CSS brightness),
@@ -26,9 +28,6 @@ const roundStart = (t: number) => Math.max(0, Math.floor(t / HLS_SEGMENT_SECONDS
 const GAIN_MIN = 0.25;
 const GAIN_MAX = 2.5;
 const GAIN_DEFAULT = 1;
-// Глобальный выбор битности выхода (8/10). 10 => HEVC (без откатов).
-const BD_STORAGE_KEY = 'tp:bitdepth';
-
 // Не начинаем воспроизведение, пока сервер не натранскодировал вперёд хотя бы столько
 // секунд (после перемотки/старта). Предохранитель по времени — чтобы не залипнуть,
 // если транскод не успевает (тогда играем как есть).
@@ -40,21 +39,6 @@ const PLAY_GATE_TIMEOUT_MS = 25000;
 const RESUME_MIN_SEC = 3;
 const RESUME_SAVE_INTERVAL_MS = 5000;
 const RESUME_SAVE_DELTA_SEC = 5;
-
-// Доступные потолки разрешения транскода (по убыванию).
-const RES_OPTIONS = [2160, 1440, 1080, 720, 480, 360];
-
-// Ступени качества транскода (0 — максимум). Должны совпадать с server/src/quality.ts.
-const QUALITY_OPTIONS = [
-  'Max · QP 12',
-  'Very high · QP 16',
-  'High · QP 18',
-  'Raised · QP 20',
-  'Standard · QP 23',
-  'Economy · QP 27',
-  'Minimum · QP 31',
-] as const;
-const DEFAULT_QUALITY = 4;
 
 // Метка потолка для меню качества.
 const resLabel = (r: number): string => {
@@ -198,6 +182,7 @@ export function Player({
   const transcodedSecRef = useRef<number | null>(null);
   const playPendingRef = useRef(false);
   const playGateDeadlineRef = useRef(0);
+  const playGateTimerRef = useRef<number | null>(null);
   const seekStartRef = useRef<number | null>(null);
   const stallStartRef = useRef<number | null>(null);
   const statusOptsRef = useRef<{ audio: number | null; start: number; pos: number; res: number | null; quality: number; bd: number; paused: boolean }>({
@@ -250,6 +235,9 @@ export function Player({
   const [error, setError] = useState<string | null>(null);
   // Инкремент пересоздаёт HLS-сессию (кнопка «Повторить» после фатальной ошибки).
   const [retryNonce, setRetryNonce] = useState(0);
+  // Инкремент перезапрашивает список файлов/probe (отдельно от retryNonce: probe-эффект
+  // сам инкрементит retryNonce, поэтому общий счётчик дал бы бесконечный цикл).
+  const [refetchNonce, setRefetchNonce] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [buffering, setBuffering] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
@@ -266,14 +254,8 @@ export function Player({
   // Gain (1 = без изменений) — клиентский пост-обработчик (CSS brightness на видео),
   // per-title. HLS не пересобираем: banding исключаем битностью выхода, а не гейном.
   const [gain, setGain] = useState<number>(GAIN_DEFAULT);
-  // Глобальная битность выхода (8/10), переключатель рядом с субтитрами.
-  const [bitDepth, setBitDepth] = useState<8 | 10>(() => {
-    try {
-      return localStorage.getItem(BD_STORAGE_KEY) === '10' ? 10 : 8;
-    } catch {
-      return 8;
-    }
-  });
+  // Битность выхода (8/10) в пилюле «Качество». По умолчанию — 8.
+  const [bitDepth, setBitDepth] = useState<8 | 10>(8);
   // Поддерживает ли браузер 10-бит HEVC в MSE (у Edge без HEVC Video Extensions — нет).
   const hevcMseSupported = useMemo(() => {
     try {
@@ -319,18 +301,36 @@ export function Player({
   const requestPlay = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
+    const clearGate = () => {
+      if (playGateTimerRef.current != null) {
+        window.clearTimeout(playGateTimerRef.current);
+        playGateTimerRef.current = null;
+      }
+    };
     if (directPlay) {
+      clearGate();
       playPendingRef.current = false;
       video.play().catch(() => {});
       return;
     }
     const ahead = (transcodedSecRef.current ?? 0) - video.currentTime;
     if (ahead >= PLAY_BUFFER_AHEAD_SEC || Date.now() >= playGateDeadlineRef.current) {
+      clearGate();
       playPendingRef.current = false;
       video.play().catch(() => {});
     } else {
       playPendingRef.current = true;
       setBuffering(true);
+      // Предохранитель: watcher ниже срабатывает только на изменение transcodedSec,
+      // но если транскод замер (короткий клип / конец файла) — transcodedSec не
+      // меняется, и без таймера гейт залипнет. Перепроверяем ровно по дедлайну.
+      if (playGateTimerRef.current == null) {
+        const ms = Math.max(0, playGateDeadlineRef.current - Date.now()) + 50;
+        playGateTimerRef.current = window.setTimeout(() => {
+          playGateTimerRef.current = null;
+          requestPlay();
+        }, ms);
+      }
     }
   }, [directPlay]);
 
@@ -354,6 +354,9 @@ export function Player({
   const changeGain = (value: number) => {
     const g = Math.min(GAIN_MAX, Math.max(GAIN_MIN, value));
     setGain(g);
+    // Пишем в avPrefsRef синхронно (не в дебаунсе): иначе быстрый переход на другую
+    // серию пересеит gain из старого значения.
+    avPrefsRef.current.gain = g;
     if (gainPersistTimerRef.current) window.clearTimeout(gainPersistTimerRef.current);
     gainPersistTimerRef.current = window.setTimeout(() => {
       gainPersistTimerRef.current = null;
@@ -472,7 +475,7 @@ export function Player({
     return () => {
       cancelled = true;
     };
-  }, [topicId]);
+  }, [topicId, refetchNonce]);
 
   useEffect(() => {
     if (fileIndex == null) return;
@@ -487,9 +490,9 @@ export function Player({
     setSubWindowStart(0);
     setTranscodedSec(null);
     // Смена файла = новая попытка: сбрасываем прошлую ошибку (иначе «мёртвый» экран
-    // остаётся навсегда и блокирует переключение эпизодов).
+    // остаётся навсегда и блокирует переключение эпизодов). HLS-эффект сам перезапустится
+    // по смене fileIndex/media, поэтому отдельный bump retryNonce здесь не нужен.
     setError(null);
-    setRetryNonce((n) => n + 1);
     mediaFileRef.current = null;
     api
       .streamProbe(topicId, fileIndex)
@@ -572,7 +575,7 @@ export function Player({
     return () => {
       cancelled = true;
     };
-  }, [topicId, fileIndex]);
+  }, [topicId, fileIndex, refetchNonce]);
 
   // Запускаем фоновую генерацию превьюшек при выборе файла (идемпотентно).
   useEffect(() => {
@@ -757,6 +760,12 @@ export function Player({
         hlsRef.current = null;
       }
       if (nativeRestore) video.removeEventListener('loadedmetadata', nativeRestore);
+      // Гейт старта привязан к сессии: не даём таймеру/флагу пережить её рестарт.
+      if (playGateTimerRef.current != null) {
+        window.clearTimeout(playGateTimerRef.current);
+        playGateTimerRef.current = null;
+      }
+      playPendingRef.current = false;
     };
   }, [topicId, fileIndex, media, audioSel, resSel, qualitySel, sessionStart, directPlay, selectedAbs, retryNonce, hlsNonce, requestPlay]);
 
@@ -974,6 +983,8 @@ export function Player({
     return () => {
       if (controlsTimerRef.current) window.clearTimeout(controlsTimerRef.current);
       if (clickTimerRef.current) window.clearTimeout(clickTimerRef.current);
+      if (playGateTimerRef.current != null) window.clearTimeout(playGateTimerRef.current);
+      if (gainPersistTimerRef.current != null) window.clearTimeout(gainPersistTimerRef.current);
       if (hlsRef.current) hlsRef.current.destroy();
       // Финальная фиксация прогресса активной серии и громкости при закрытии плеера.
       const fi = mediaFileRef.current;
@@ -1266,15 +1277,10 @@ const toggleFullscreen = () => {
     setHlsNonce((n) => n + 1);
   };
 
-  // Выбор битности выхода (8/10), глобально. 10 => HEVC без откатов.
+  // Выбор битности выхода (8/10). 10 => HEVC без откатов.
   const selectBitDepth = (next: 8 | 10) => {
     if (!hevcMseSupported || next === effectiveBitDepth) return;
     setBitDepth(next);
-    try {
-      localStorage.setItem(BD_STORAGE_KEY, String(next));
-    } catch {
-      /* ignore */
-    }
     if (directPlay) return;
     restartSession(videoRef.current);
   };
@@ -1384,6 +1390,9 @@ const toggleFullscreen = () => {
           className="btn"
           onClick={() => {
             setError(null);
+            // Перезапрашиваем список файлов/probe и пересоздаём HLS-сессию — иначе
+            // повтор после сбоя streamFiles/probe оставлял вечный спиннер/пустой плеер.
+            setRefetchNonce((n) => n + 1);
             setRetryNonce((n) => n + 1);
           }}
         >

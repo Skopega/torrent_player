@@ -1,3 +1,15 @@
+declare module 'fs-chunk-store' {
+  export default class FSChunkStore {
+    constructor(chunkLength: number, opts?: Record<string, unknown>);
+    readonly path?: string;
+    readonly files: Array<{ path: string; length: number; offset: number }>;
+    put(index: number, buf: Buffer | Uint8Array, cb: (err?: Error | null) => void): void;
+    get(index: number, opts: unknown, cb: (err: Error | null, buf?: Buffer) => void): void;
+    close(cb?: (err?: Error | null) => void): void;
+    destroy(cb?: (err?: Error | null) => void): void;
+  }
+}
+
 declare module 'bencode' {
   const bencode: { decode(data: Buffer | Uint8Array | string): Record<string, unknown> };
   export default bencode;
@@ -62,7 +74,7 @@ declare module 'webtorrent' {
     path?: string;
     addUID?: boolean;
     deselect?: boolean;
-    store?: (chunkLength: number, opts: Record<string, unknown>) => unknown;
+    store?: new (chunkLength: number, opts: Record<string, unknown>) => unknown;
     storeCacheSlots?: number;
     storeOpts?: unknown;
     destroyStoreOnDestroy?: boolean;

@@ -8,6 +8,7 @@ import WebTorrent from 'webtorrent';
 import type { Torrent, TorrentFile } from 'webtorrent';
 import parseTorrent from 'parse-torrent';
 import { ProxyAgent } from 'undici';
+import { SafeFSChunkStore, sanitizeTorrentName } from './torrent-store.js';
 import { DATA_DIR } from './store.js';
 import { FFPROBE_PATH as ffprobePath } from './media.js';
 import { log } from './logger.js';
@@ -76,6 +77,9 @@ interface Entry {
 const MAX_ACTIVE = 3;
 const IDLE_TTL_MS = 15 * 60 * 1000;
 const PROBE_BYTES = 8 * 1024 * 1024;
+// Короткий TTL негативного кеша probe: не долбим источник на каждый опрос, но даём
+// шанс, когда байты головы докачаются.
+const PROBE_NEGATIVE_TTL_MS = 10_000;
 // Таймаут ffprobe: без него чтение недокачанной головы файла висело бы вечно.
 const PROBE_TIMEOUT_MS = 20_000;
 // «Сейчас»-окно, помечаемое critical: только чтобы waitForBytes/readBytes быстрее
@@ -112,6 +116,20 @@ function hostOf(url: string): string {
     return url;
   }
 }
+
+// BEP9 `xs=` («exact source») в magnet заставляет webtorrent качать метаданные по
+// произвольному URL напрямую (своим fetch'ем мимо SSRF-защиты). Вырезаем эти
+// параметры: для обычных раздач метаданные и так приходят от пиров по ut_metadata.
+function stripMagnetXs(id: Buffer | string): Buffer | string {
+  if (typeof id !== 'string' || !id.toLowerCase().startsWith('magnet:')) return id;
+  const q = id.indexOf('?');
+  if (q < 0) return id;
+  const kept = id
+    .slice(q + 1)
+    .split('&')
+    .filter((p) => p && !/^xs=/i.test(p));
+  return id.slice(0, q + 1) + kept.join('&');
+}
 // Персист DHT-таблицы: одна общая «адресная книга» узлов на все раздачи. Без неё
 // после каждого рестарта DHT стартует с пустой таблицей и набирает узлы через
 // медленный ре-бутстрап (~5-10 минут), из-за чего пиры появляются не сразу.
@@ -134,6 +152,13 @@ export class StreamManager {
   private idleTimer: NodeJS.Timeout;
   private dhtSaveTimer: NodeJS.Timeout;
   private probeCache = new Map<string, MediaInfo>();
+  // Короткий негативный кеш: неудачный probe (байты головы ещё не доехали) не должен
+  // перезапускать ffprobe-шторм на каждый опрос, но и «залипать» надолго нельзя —
+  // голова может докачаться. TTL короткий.
+  private probeNegative = new Map<string, { media: MediaInfo; until: number }>();
+  // Дедуп одновременных probe() по ключу: N параллельных вызовов на один файл
+  // раньше плодили N×3 ffprobe-процесса.
+  private probeInflight = new Map<string, Promise<MediaInfo>>();
   private playWindows = new Map<number, { playFirst: number; playLast: number; bufLast: number }>();
   // Локальные (magnet/.torrent) источники: отрицательные topicId, в приоритете
   // перед rutracker-фетчерами (для них на rutracker не ходим вовсе).
@@ -153,6 +178,10 @@ export class StreamManager {
       dht: true,
       tracker: {},
       utp: process.env.TP_UTP === '1',
+      // BEP19 web seeds: недоверенный торрент может прописать url-list на приватные
+      // адреса (роутер/NAS/localhost) — webtorrent качает их своим fetch'ем мимо нашей
+      // SSRF-защиты. Пиры по TCP/DHT это не затрагивает.
+      webSeeds: false,
       ...(torrentPort ? { torrentPort } : {}),
     });
     this.client.on('error', (err) => {
@@ -210,7 +239,7 @@ export class StreamManager {
     const existing = this.entries.get(topicId);
     if (existing) {
       existing.lastUsed = Date.now();
-      if (existing.torrent) {
+      if (existing.torrent && !existing.torrent.destroyed) {
         if (existing.torrent.paused) {
           existing.torrent.resume();
           // stop() снял selection'ы через deselect — возвращаем желаемые диапазоны.
@@ -220,6 +249,13 @@ export class StreamManager {
         return existing.torrent;
       }
       if (existing.pending) return existing.pending;
+      // Торрент уничтожен извне (ошибка store/дубль по infoHash) — запись «мертва»:
+      // выбрасываем её, иначе load()/getFile() навсегда возвращали бы сломанный торрент.
+      if (existing.torrent) {
+        this.entries.delete(topicId);
+        this.playWindows.delete(topicId);
+        log.warn(`[stream] dropped destroyed torrent for topic ${topicId}`);
+      }
     }
 
     if (!opts.quiet) this.stopAllExcept(topicId);
@@ -318,6 +354,15 @@ export class StreamManager {
           httpsAgent: this.trackerAgent.agent,
         };
       }
+    } else if (this.trackerAgent) {
+      // VPN выключен (proxy стал null) — прокси-агент больше не нужен: закрываем,
+      // иначе он с открытыми сокетами утекал до конца процесса.
+      try {
+        void this.trackerAgent.agent.close();
+      } catch {
+        /* ignore */
+      }
+      this.trackerAgent = null;
     }
     (this.client as unknown as { tracker: unknown }).tracker = opts;
   }
@@ -452,7 +497,7 @@ export class StreamManager {
 
         let torrent: Torrent;
         try {
-          torrent = this.client.add(torrentId, this.addOptions(skipVerify), (_t) => {
+          torrent = this.client.add(stripMagnetXs(torrentId), this.addOptions(skipVerify), (_t) => {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
@@ -505,7 +550,7 @@ export class StreamManager {
     try {
       const parsed = await parseTorrent(torrentBuf);
       if (!parsed.infoHash || !parsed.length || !parsed.files?.length) return false;
-      const dir = path.join(TORRENT_DIR, `${parsed.name} - ${parsed.infoHash.slice(0, 8)}`);
+      const dir = path.join(TORRENT_DIR, `${sanitizeTorrentName(parsed.name)} - ${parsed.infoHash.slice(0, 8)}`);
       const root = path.resolve(dir);
       const stat = fs.promises.stat;
       let total = 0;
@@ -571,6 +616,7 @@ export class StreamManager {
       deselect: true,
       addUID: true,
       path: TORRENT_DIR,
+      store: SafeFSChunkStore,
       storeCacheSlots: 40,
       skipVerify,
       announce: EXTRA_TRACKERS,
@@ -588,7 +634,6 @@ export class StreamManager {
   async warm(topicId: number): Promise<void> {
     try {
       const torrent = await this.load(topicId, { quiet: true });
-      void this.announceTrackers(torrent);
       const pieceLen = torrent.pieceLength;
       const n = torrent.pieces.length;
       if (n <= 0 || pieceLen <= 0) return;
@@ -635,6 +680,7 @@ export class StreamManager {
 
   async getFile(topicId: number, fileIndex: number): Promise<{ torrent: Torrent; file: TorrentFile }> {
     const torrent = await this.load(topicId);
+    if (torrent.destroyed) throw new Error('Торрент раздачи уничтожен. Повторите попытку.');
     const file = torrent.files[fileIndex];
     if (!file) throw new Error('Файл не найден в раздаче.');
     this.touch(topicId);
@@ -802,35 +848,6 @@ export class StreamManager {
     }
   }
 
-  resume(topicId: number, fileIndex: number): void {
-    const entry = this.entries.get(topicId);
-    const t = entry?.torrent;
-    if (!t || t.destroyed) return;
-    try {
-      t.resume();
-      const sched = this.schedulerFor(topicId);
-      for (let i = 0; i < t.files.length; i++) {
-        if (i !== fileIndex) {
-          const f = t.files[i];
-          if (f.length > 0) {
-            const r = pieceRange(f.offset, 0, f.length - 1, t.pieceLength);
-            try {
-              f.deselect();
-            } catch {
-              /* ignore */
-            }
-            sched?.externalDeselect(r.first, r.last);
-          }
-        }
-      }
-      // stop() снял selection'ы — возвращаем желаемые (окно плейбека и пр.).
-      sched?.commit();
-    } catch {
-      /* ignore */
-    }
-    log.info(`[stream] resume topic ${topicId}`);
-  }
-
   async files(topicId: number): Promise<StreamFile[]> {
     const torrent = await this.load(topicId);
     const files: StreamFile[] = torrent.files.map((f, i) => ({
@@ -993,24 +1010,6 @@ export class StreamManager {
     await this.prioritizeRange(topicId, fileIndex, tailStart, file.length - 1, Priority.SEEK);
   }
 
-  // Приоритетно качает диапазон байт, соответствующий окну [startSec, startSec+durSec].
-  async prioritizeTimeRange(
-    topicId: number,
-    fileIndex: number,
-    startSec: number,
-    durSec: number,
-  ): Promise<void> {
-    const { file } = await this.getFile(topicId, fileIndex);
-    const media = await this.probe(topicId, fileIndex);
-    const dur = media.durationSec ?? 0;
-    if (dur <= 0 || file.length <= 0) return;
-    const startFrac = Math.min(1, Math.max(0, startSec / dur));
-    const endFrac = Math.min(1, Math.max(0, (startSec + durSec) / dur));
-    const byteStart = Math.floor(startFrac * file.length);
-    const byteEnd = Math.max(byteStart, Math.floor(endFrac * file.length) - 1);
-    await this.prioritizeRange(topicId, fileIndex, byteStart, byteEnd, Priority.SEEK);
-  }
-
   // Помечает диапазон байт приоритетным и ждёт, пока его куски реально скачаются
   // (с таймаутом). Нужно, чтобы ffmpeg не блокировался на нескачанных данных.
   async waitForBytes(
@@ -1127,6 +1126,10 @@ export class StreamManager {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        // Снимаем поднятый приоритет и на успехе: иначе desired растёт монотонно и
+        // прочитанные (напр. под субтитры) куски залипают выбранными навсегда.
+        scheduler?.releaseAt(first, last, [priority]);
+        scheduler?.commit();
         resolve(Buffer.concat(chunks));
       });
       stream.on('error', () => {
@@ -1178,7 +1181,21 @@ export class StreamManager {
     const key = `${topicId}:${fileIndex}`;
     const cached = this.probeCache.get(key);
     if (cached) return cached;
+    const neg = this.probeNegative.get(key);
+    if (neg) {
+      if (Date.now() < neg.until) return neg.media;
+      this.probeNegative.delete(key);
+    }
+    const inflight = this.probeInflight.get(key);
+    if (inflight) return inflight;
+    const p = this.probeInternal(key, topicId, fileIndex).finally(() => {
+      if (this.probeInflight.get(key) === p) this.probeInflight.delete(key);
+    });
+    this.probeInflight.set(key, p);
+    return p;
+  }
 
+  private async probeInternal(key: string, topicId: number, fileIndex: number): Promise<MediaInfo> {
     const { torrent, file } = await this.getFile(topicId, fileIndex);
     const ext = extOf(file.name);
     const limit = Math.min(file.length, PROBE_BYTES);
@@ -1218,7 +1235,7 @@ export class StreamManager {
       await new Promise((r) => setTimeout(r, 1500));
     }
     log.warn(`[stream] ffprobe failed for ${file.name}: ${lastErr instanceof Error ? lastErr.message : lastErr}`);
-    return {
+    const fallback: MediaInfo = {
       container: ext || null,
       videoCodec: null,
       audioCodec: null,
@@ -1232,6 +1249,8 @@ export class StreamManager {
       audioTracks: [],
       subtitleTracks: [],
     };
+    this.probeNegative.set(key, { media: fallback, until: Date.now() + PROBE_NEGATIVE_TTL_MS });
+    return fallback;
   }
 
   // Останавливает и удаляет с диска все раздачи, но оставляет WebTorrent-клиент живым.
@@ -1245,6 +1264,7 @@ export class StreamManager {
     }
     this.entries.clear();
     this.probeCache.clear();
+    this.probeNegative.clear();
     this.playWindows.clear();
     log.info('[stream] cleared all torrents');
   }
@@ -1288,6 +1308,9 @@ export class StreamManager {
     for (const key of [...this.probeCache.keys()]) {
       if (key.startsWith(`${topicId}:`)) this.probeCache.delete(key);
     }
+    for (const key of [...this.probeNegative.keys()]) {
+      if (key.startsWith(`${topicId}:`)) this.probeNegative.delete(key);
+    }
     if (pending && !t) {
       // Метаданные ещё грузятся: когда загрузка завершится, раздача уже удалена —
       // уничтожаем её, чтобы не оставить «осиротевший» торрент в клиенте.
@@ -1310,13 +1333,29 @@ export class StreamManager {
     clearInterval(this.dhtSaveTimer);
     this.saveDhtNodes();
     for (const [, entry] of this.entries) {
-      if (entry.torrent) {
+      if (entry.torrent && !entry.torrent.destroyed) {
         await new Promise<void>((res) => entry.torrent?.destroy(() => res()));
       }
     }
     this.entries.clear();
     this.probeCache.clear();
-    await new Promise<void>((res) => this.client.destroy(() => res()));
+    this.probeNegative.clear();
+    if (this.trackerAgent) {
+      try {
+        void this.trackerAgent.agent.close();
+      } catch {
+        /* ignore */
+      }
+      this.trackerAgent = null;
+    }
+    // Уже уничтожённый клиент не вызывает колбэк → не ждём вечно (зависание shutdown).
+    if (!(this.client as unknown as { destroyed?: boolean }).destroyed) {
+      try {
+        await new Promise<void>((res) => this.client.destroy(() => res()));
+      } catch {
+        /* клиент уничтожен параллельно */
+      }
+    }
     log.info('[stream] client destroyed');
   }
 }

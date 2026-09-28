@@ -3,6 +3,9 @@
 // клиентские seek/stall), чтобы понять, какой этап тормозит плейбек/перемотку.
 
 const SAMPLE_CAP = 200;
+// Верхний предел числа метрик: POST /api/perf принимает произвольные имена, и без
+// лимита карта росла бы с каждым новым именем от клиента.
+const MAX_METRICS = 200;
 
 interface Acc {
   count: number;
@@ -29,6 +32,7 @@ class Perf {
     if (!Number.isFinite(ms) || ms < 0) return;
     let acc = this.metrics.get(name);
     if (!acc) {
+      if (this.metrics.size >= MAX_METRICS) return;
       acc = { count: 0, totalMs: 0, minMs: Infinity, maxMs: 0, samples: [] };
       this.metrics.set(name, acc);
     }

@@ -134,17 +134,21 @@ export class SubtitleManager {
         next ? next.clusterPos - c.clusterPos : MAX_CLUSTER_READ_BYTES,
         MAX_CLUSTER_READ_BYTES,
       );
-      const rawSize = el.ok && el.size > 0 ? el.size : upper;
-      const size = Math.min(rawSize, upper);
-      if (size <= 0) {
+      // el.size — размер данных элемента БЕЗ заголовка; readBytes/areBytesReady
+      // работают с включающим end, поэтому читаем до absPos + dataPos + size - 1.
+      // Иначе буфер короче на (dataPos - 1) и последний субтитр кластера обрезается.
+      const rawTotal = el.ok && el.size > 0 ? el.dataPos + el.size : upper;
+      const total = Math.min(rawTotal, upper);
+      if (total <= 0) {
         done = false;
         continue;
       }
-      if (!(await this.stream.areBytesReady(topicId, fileIndex, absPos, absPos + size))) {
+      const endPos = absPos + total - 1;
+      if (!(await this.stream.areBytesReady(topicId, fileIndex, absPos, endPos))) {
         done = false;
         continue;
       }
-      const buf = await this.stream.readBytes(topicId, fileIndex, absPos, absPos + size, 2000);
+      const buf = await this.stream.readBytes(topicId, fileIndex, absPos, endPos, 2000);
       if (!buf) {
         done = false;
         continue;
@@ -162,8 +166,25 @@ export class SubtitleManager {
       .filter((c) => c.end > t && c.start < t + dur);
     if (done) {
       this.memo.set(key, { cues, done: true, at: Date.now() });
+      this.pruneMemo();
     }
     return { cues, done };
+  }
+
+  // Ограничивает memo: ключи (trackPosition,t,dur) плодятся при опросе раз в 2с;
+  // удаляем протухшие (TTL 10 мин), а при переполнении — самые старые.
+  private pruneMemo(): void {
+    if (this.memo.size <= 400) return;
+    const now = Date.now();
+    const TTL = 10 * 60 * 1000;
+    for (const [k, v] of this.memo) {
+      if (now - v.at > TTL) this.memo.delete(k);
+    }
+    while (this.memo.size > 200) {
+      const oldest = this.memo.keys().next().value as string | undefined;
+      if (oldest == null) break;
+      this.memo.delete(oldest);
+    }
   }
 
   private clustersForWindow(index: MkvIndex, t: number, dur: number): CuePoint[] {
@@ -208,14 +229,9 @@ export class SubtitleManager {
     for (const key of this.failUntil.keys()) {
       if (key.startsWith(`${topicId}:`)) this.failUntil.delete(key);
     }
-    this.memo.clear();
-  }
-
-  stopFile(topicId: number, fileIndex: number): void {
-    const key = this.indexKey(topicId, fileIndex);
-    this.indexCache.delete(key);
-    this.failUntil.delete(key);
-    this.memo.clear();
+    for (const key of this.memo.keys()) {
+      if (key.startsWith(`${topicId}:`)) this.memo.delete(key);
+    }
   }
 
   stopAll(): void {

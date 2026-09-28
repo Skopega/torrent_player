@@ -225,7 +225,9 @@ async function readElementData(
   if (!hdr) return null;
   const el = parseElement(hdr, 0);
   if (!el.ok || el.size <= 0) return null;
-  const buf = await readRange(absPos, absPos + el.size, 3000);
+  // readRange end включающий: чтобы получить el.size байт данных после заголовка,
+  // читаем до absPos + el.dataPos + el.size - 1 (иначе теряем хвост элемента).
+  const buf = await readRange(absPos, absPos + el.dataPos + el.size - 1, 3000);
   if (!buf) return null;
   return buf.subarray(el.dataPos);
 }

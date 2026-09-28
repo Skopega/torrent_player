@@ -77,14 +77,16 @@ function buildMkv(): string {
   return mkv;
 }
 
+// ВАЖНО: end включающий — как production StreamManager.readBytes (stream.ts).
+// Exclusive-семантика раньше маскировала off-by-header при чтении кластеров.
 function readRangeFor(file: string) {
   return async (start: number, end: number): Promise<Buffer | null> => {
     const size = fs.statSync(file).size;
     const s = Math.max(0, start);
-    const e = Math.min(size, end);
-    if (e <= s) return null;
+    const e = Math.min(size - 1, end);
+    if (e < s) return null;
     const fd = fs.openSync(file, 'r');
-    const buf = Buffer.alloc(e - s);
+    const buf = Buffer.alloc(e - s + 1);
     try {
       fs.readSync(fd, buf, 0, buf.length, s);
     } finally {
@@ -163,7 +165,8 @@ async function collectAllCues(
     assert.ok(header);
     const el = parseElement(header!, 0);
     assert.ok(el.ok && el.size > 0);
-    const buf = await readRangeFor(mkv)(abs, abs + el.size);
+    // Читаем включая весь элемент (заголовок + данные), как в subs.ts.
+    const buf = await readRangeFor(mkv)(abs, abs + el.dataPos + el.size - 1);
     assert.ok(buf);
     const el2 = parseElement(buf!, 0);
     blocks.push(...parseCluster(buf!.subarray(el2.dataPos), trackNumber));
