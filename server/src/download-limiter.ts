@@ -13,8 +13,7 @@
 // multiplicative decrease при давлении, быстрый рост в спокойствии.
 //
 // Внешние ручки (hls.ts): TP_STREAM_LIMIT_MBPS — жёсткий ручной оверрайд,
-// TP_STREAM_ADAPTIVE=0 — полностью снять лимит, TP_STREAM_CAP_AFTER_SEC — порог
-// буфера, после которого включается контур.
+// TP_STREAM_ADAPTIVE=0 — полностью снять лимит.
 
 export interface LimiterSignals {
   // Медиана/min времени отдачи сегмента в окне (мс) и число замеров в окне.

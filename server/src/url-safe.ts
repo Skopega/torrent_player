@@ -109,7 +109,3 @@ export async function assertSafeHttpUrl(raw: string): Promise<URL> {
   u.hash = '';
   return u;
 }
-
-export function clearUrlVerdictCache(): void {
-  verdictCache.clear();
-}

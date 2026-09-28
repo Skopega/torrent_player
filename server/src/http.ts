@@ -83,24 +83,6 @@ export class HttpClient {
     return this.cookies.join('; ');
   }
 
-  private mergeSetCookie(setCookies: string[]) {
-    for (const sc of setCookies) {
-      const first = sc.split(';')[0] ?? '';
-      const idx = first.indexOf('=');
-      if (idx < 0) continue;
-      const name = first.slice(0, idx).trim();
-      let value = first.slice(idx + 1).trim();
-      const existing = this.cookies.findIndex((c) => c.startsWith(name + '='));
-      if (value === 'deleted' || value === '') {
-        if (existing >= 0) this.cookies.splice(existing, 1);
-        continue;
-      }
-      const kv = `${name}=${value}`;
-      if (existing >= 0) this.cookies[existing] = kv;
-      else this.cookies.push(kv);
-    }
-  }
-
   private async dispatcherFor(direct: boolean | undefined): Promise<Dispatcher | undefined> {
     // Весь трафик к сайтам идёт через активную vless-прокси (если включена);
     // direct=true — для загрузки подписки и health-проверок самой прокси.
@@ -214,14 +196,6 @@ async function readBodyLimited(res: import('undici').Response, maxBytes: number)
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   return Buffer.concat(chunks);
-}
-
-export function formUrlEncode(fields: Record<string, string>): string {
-  const parts: string[] = [];
-  for (const [k, v] of Object.entries(fields)) {
-    parts.push(`${encodeCp1251(k)}=${encodeCp1251(v)}`);
-  }
-  return parts.join('&');
 }
 
 export function encodeCp1251(s: string): string {

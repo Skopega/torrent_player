@@ -65,33 +65,6 @@ const FAILED_IMAGES_FILE = path.join(CACHE_DIR, 'failed-images.json');
 const IMG_DIR = path.join(CACHE_DIR, 'img');
 const TOPICS_DIR = path.join(CACHE_DIR, 'topics');
 
-function dirSize(dir: string): number {
-  let total = 0;
-  const stack = [dir];
-  while (stack.length) {
-    const cur = stack.pop()!;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(cur, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const e of entries) {
-      const p = path.join(cur, e.name);
-      if (e.isDirectory()) {
-        stack.push(p);
-      } else {
-        try {
-          total += fs.statSync(p).size;
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-  }
-  return total;
-}
-
 export function ensureDir(dir: string) {
   fs.mkdirSync(dir, { recursive: true });
 }
@@ -503,28 +476,12 @@ export class Store {
     writeJson(path.join(TOPICS_DIR, String(id) + '.json'), topic);
   }
 
-  cacheSize(): number {
-    return dirSize(CACHE_DIR);
-  }
-
   async cacheSizeAsync(): Promise<number> {
     return asyncDirSize(CACHE_DIR);
   }
 
   // Только метаданные: постеры (img/), json-файлы и кэш тем (topics/).
   // Не включает видео-кеши (торренты, HLS, превью).
-  metadataCacheSize(): number {
-    let total = dirSize(IMG_DIR) + dirSize(TOPICS_DIR);
-    for (const f of [POSTERS_FILE, BITRATES_FILE, RESOLUTIONS_FILE, DURATIONS_FILE, FAILED_IMAGES_FILE]) {
-      try {
-        total += fs.statSync(f).size;
-      } catch {
-        /* нет файла */
-      }
-    }
-    return total;
-  }
-
   async metadataCacheSizeAsync(): Promise<number> {
     let total = (await asyncDirSize(IMG_DIR)) + (await asyncDirSize(TOPICS_DIR));
     for (const f of [POSTERS_FILE, BITRATES_FILE, RESOLUTIONS_FILE, DURATIONS_FILE, FAILED_IMAGES_FILE]) {

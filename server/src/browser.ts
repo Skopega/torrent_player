@@ -496,5 +496,3 @@ export class BrowserManager {
     this.chromeProc = null;
   }
 }
-
-export const browserManager = new BrowserManager();

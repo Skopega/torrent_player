@@ -740,10 +740,6 @@ export class StreamManager {
     this.localSources.set(topicId, spec);
   }
 
-  removeLocalSource(topicId: number): void {
-    this.localSources.delete(topicId);
-  }
-
   // Имя загруженной раздачи (для magnet — после получения метаданных). null, если
   // раздача ещё не загружена или имени нет.
   torrentName(topicId: number): string | null {

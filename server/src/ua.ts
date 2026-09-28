@@ -96,7 +96,3 @@ export function resolveUserAgent(): string {
   cached = `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`;
   return cached;
 }
-
-export function resetUserAgentCache(): void {
-  cached = null;
-}
